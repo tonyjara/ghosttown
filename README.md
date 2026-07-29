@@ -52,10 +52,17 @@ Mouse: click a pane to focus it, click a tab to select it.
 ## Configuration
 
 Defaults live in [`config.default.toml`](config.default.toml) (documented
-inline). Override anything in `~/.config/ghosttown/config.toml` — your file
-only needs the values you change, and it always wins over the defaults.
-`$GHOSTTOWN_CONFIG` points at an alternate file, `$XDG_CONFIG_HOME` is
-respected.
+inline). The user config is **not** created automatically — copy the defaults
+over once and edit from there:
+
+```sh
+mkdir -p ~/.config/ghosttown && cp config.default.toml ~/.config/ghosttown/config.toml
+```
+
+Your file always wins over the shipped defaults. It only *needs* the values
+you change — trimming it to just those lets future default changes flow
+through. `$GHOSTTOWN_CONFIG` points at an alternate file, `$XDG_CONFIG_HOME`
+is respected.
 
 ```toml
 # ~/.config/ghosttown/config.toml
