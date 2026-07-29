@@ -1,0 +1,32 @@
+{
+  "name": "ghosttown",
+  "version": "0.1.0",
+  "description": "Agent-first terminal multiplexer: per-pane tabs, agent status, notifications",
+  "type": "module",
+  "bin": {
+    "gt": "./src/index.ts",
+    "ghosttown": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun --conditions=browser run src/index.ts",
+    "dev": "bun --conditions=browser run --watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "harness": "bun run scripts/harness.ts"
+  },
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@opentui/core": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "bun-pty": "0.4.10",
+    "ghostty-opentui": "1.5.0",
+    "solid-js": "1.9.14"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.8.0"
+  }
+}

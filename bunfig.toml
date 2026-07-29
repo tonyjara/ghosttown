@@ -1,0 +1,6 @@
+# Solid JSX needs the real compiler transform (reactive prop getters);
+# without it, runtime JSX evaluates component props once and nothing updates.
+preload = ["@opentui/solid/preload"]
+
+[test]
+preload = ["@opentui/solid/preload"]
