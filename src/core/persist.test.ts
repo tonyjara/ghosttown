@@ -42,8 +42,8 @@ function sample(session = "main"): PersistedSession {
         },
         focusedPaneId: "p2",
         panes: [
-          { id: "p1", activeIdx: 0, surfaces: [{ cwd: "/tmp" }] },
-          { id: "p2", activeIdx: 1, surfaces: [{ cwd: "/tmp" }, { cwd: null }] },
+          { id: "p1", activeIdx: 0, surfaces: [{ id: "s1", cwd: "/tmp" }] },
+          { id: "p2", activeIdx: 1, surfaces: [{ id: "s2", cwd: "/tmp" }, { id: "s3", cwd: null }] },
         ],
       },
     ],

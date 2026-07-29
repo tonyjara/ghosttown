@@ -3,9 +3,9 @@
  * user's file. The user's values always win; keybind lists replace the
  * default list for that action.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { dbg } from "./debug";
 
 export interface KeybindsConfig {
@@ -125,6 +125,11 @@ export function userConfigPath(): string {
   return join(xdg, "ghosttown", "config.toml");
 }
 
+/** The shipped defaults, next to package.json. */
+export function defaultConfigPath(): string {
+  return join(import.meta.dir, "..", "..", "config.default.toml");
+}
+
 function parseToml(text: string): Record<string, unknown> {
   return (Bun as unknown as { TOML: { parse: (s: string) => Record<string, unknown> } }).TOML.parse(
     text,
@@ -135,8 +140,7 @@ let cached: Config | null = null;
 
 export function loadConfig(): Config {
   if (cached) return cached;
-  const defaultsPath = join(import.meta.dir, "..", "..", "config.default.toml");
-  const defaults = parseToml(readFileSync(defaultsPath, "utf8")) as unknown as Config;
+  const defaults = parseToml(readFileSync(defaultConfigPath(), "utf8")) as unknown as Config;
 
   let merged = defaults;
   const userPath = userConfigPath();
@@ -156,6 +160,65 @@ export function loadConfig(): Config {
 /** Test hook: force a specific config (or null to reload from disk). */
 export function setConfigForTest(config: Config | null): void {
   cached = config;
+}
+
+/** Drop the cache so the next loadConfig() re-reads both files. */
+export function reloadConfig(): Config {
+  cached = null;
+  return loadConfig();
+}
+
+/** Editors write twice (temp file, then rename) — one callback per save. */
+const WATCH_DEBOUNCE_MS = 150;
+
+/**
+ * Call back when either config file changes, so a save can be applied without
+ * restarting anything. The containing *directory* is watched and events are
+ * filtered by filename: a watch on the file itself stops firing as soon as an
+ * editor replaces it rather than writing in place. Returns a stop function.
+ */
+export function watchConfig(onChange: () => void): () => void {
+  const watchers: FSWatcher[] = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const byDir = new Map<string, Set<string>>();
+  for (const path of [userConfigPath(), defaultConfigPath()]) {
+    const dir = dirname(path);
+    if (!existsSync(dir)) continue;
+    const files = byDir.get(dir) ?? new Set<string>();
+    files.add(basename(path));
+    byDir.set(dir, files);
+  }
+
+  for (const [dir, files] of byDir) {
+    try {
+      watchers.push(
+        watch(dir, (_event, name) => {
+          // A rename event can arrive with no name; treat that as a hit.
+          if (name && !files.has(name)) return;
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(() => {
+            timer = null;
+            onChange();
+          }, WATCH_DEBOUNCE_MS);
+        }),
+      );
+    } catch (err) {
+      dbg("config: cannot watch", dir, err as Error);
+    }
+  }
+  dbg("config: watching", watchers.length, "directories");
+
+  return () => {
+    if (timer) clearTimeout(timer);
+    for (const w of watchers) {
+      try {
+        w.close();
+      } catch {
+        // already closed
+      }
+    }
+  };
 }
 
 export function keysForAction(config: Config, action: Action): string[] {

@@ -1,15 +1,18 @@
 /**
  * Session snapshots — tmux-resurrect/continuum, minus the guesswork.
  *
- * The TUI process owns every surface PTY, so a reload (or a crash, or a
- * reboot) takes the whole layout with it. This module keeps a small JSON
- * snapshot of the *structure* in the XDG state dir and hands it back on the
- * next start: workspaces, split ratios, panes, tab order, and the directory
- * each surface was sitting in.
+ * A crash or a reboot takes the whole layout with it, so this module keeps a
+ * small JSON snapshot of the *structure* in the XDG state dir and hands it
+ * back on the next start: workspaces, split ratios, panes, tab order, and the
+ * directory each surface was sitting in.
  *
  * What it deliberately does NOT do is restore processes — a restored surface
- * is a fresh shell in its old cwd. Nothing here reaches into the store; state
- * .ts owns the serialize/restore logic and calls in.
+ * is a fresh shell in its old cwd. A TUI *reload* doesn't come through here at
+ * all: the pty host still holds those surfaces, so they are adopted alive
+ * (src/attach/ptyhost.ts), and the snapshot is only the cold-start fallback.
+ *
+ * The pty host writes the file, since it owns the pids the cwds come from;
+ * state.ts serializes the structure and sends it over.
  */
 import { existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -18,9 +21,11 @@ import { dbg } from "./debug";
 import type { LayoutNode } from "./types";
 
 /** Bumped whenever the shape below changes; older files are ignored. */
-export const SNAPSHOT_VERSION = 1;
+export const SNAPSHOT_VERSION = 2;
 
 export interface PersistedSurface {
+  /** Host-side surface id — how a reloaded TUI finds the live pty again. */
+  id: string;
   /** Where the shell was; null when it could not be read. */
   cwd: string | null;
 }
@@ -144,6 +149,41 @@ export function readCwds(pids: number[]): Map<number, string> {
     dbg("persist: lsof failed", err as Error);
     return new Map();
   }
+}
+
+/**
+ * Fill in each surface's cwd from a surface-id → directory map. Surfaces
+ * missing from it keep the directory already in the snapshot, so a transient
+ * lsof failure never erases what we knew a minute ago.
+ */
+export function withCwds(
+  snap: PersistedSession,
+  cwdBySurface: Map<string, string>,
+): PersistedSession {
+  return {
+    ...snap,
+    workspaces: snap.workspaces.map((ws) => ({
+      ...ws,
+      panes: ws.panes.map((pane) => ({
+        ...pane,
+        surfaces: pane.surfaces.map((s) => ({
+          ...s,
+          cwd: cwdBySurface.get(s.id) ?? s.cwd ?? null,
+        })),
+      })),
+    })),
+  };
+}
+
+/** Surface id → cwd, for everything the snapshot already knows about. */
+export function cwdsOf(snap: PersistedSession | null): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const ws of snap?.workspaces ?? []) {
+    for (const pane of ws.panes) {
+      for (const s of pane.surfaces) if (s.cwd) out.set(s.id, s.cwd);
+    }
+  }
+  return out;
 }
 
 /** Same, off the render thread — every save but the last one takes this path. */

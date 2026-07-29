@@ -64,7 +64,7 @@ export function TerminalSurface(props: {
   });
 
   onCleanup(() => {
-    registry.get(props.sid)?.detachRenderable();
+    if (term) registry.get(props.sid)?.detachRenderable(term);
     if (term && container) {
       try {
         container.remove(term);

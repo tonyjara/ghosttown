@@ -6,10 +6,15 @@
  * Hierarchy: profile (= the session) → workspaces → panes → tabs (surfaces).
  * Every workspace's panes stay mounted in the UI (a persistent emulator dies
  * with its renderable); only the active workspace is visible.
+ *
+ * The surface PTYs live in the daemon's pty host, not here — see core/runtime
+ * .ts. This module drives them by id and takes their output, status and titles
+ * as events; on startup it adopts whatever the host still has running.
  */
 import { createStore, produce } from "solid-js/store";
-import { existsSync, readdirSync } from "node:fs";
-import { defaultSocketDir, RELOAD_EXIT_CODE } from "../control/protocol";
+import { readdirSync } from "node:fs";
+import type { HostEvents } from "../control/hostclient";
+import { defaultSocketDir, RELOAD_EXIT_CODE, type HostSurfaceInfo } from "../control/protocol";
 import { loadConfig, setConfigForTest } from "./config";
 import { dbg } from "./debug";
 import {
@@ -26,16 +31,8 @@ import {
   type Gutter,
 } from "./layout";
 import { desktopNotify } from "./notify";
-import {
-  deleteSnapshot,
-  readCwds,
-  readCwdsAsync,
-  readSnapshot,
-  writeSnapshot,
-  SNAPSHOT_VERSION,
-  type PersistedSession,
-} from "./persist";
-import { RuntimeRegistry, SurfaceRuntime } from "./runtime";
+import { readSnapshot, SNAPSHOT_VERSION, type PersistedSession } from "./persist";
+import { hostSend, RuntimeRegistry, SurfaceRuntime } from "./runtime";
 import type {
   AgentStatus,
   LayoutNode,
@@ -111,7 +108,6 @@ export const [store, setStore] = createStore<StoreShape>({
 
 let socketPath = "";
 let onQuit: (code: number) => void = (code) => process.exit(code);
-let tickTimer: ReturnType<typeof setInterval> | null = null;
 
 // ---------------------------------------------------------------------------
 // Derived geometry & lookups
@@ -265,58 +261,59 @@ function spawnSurface(
   const cmd = command || loadConfig().general.shell || process.env.SHELL || "/bin/zsh";
   const rect = allRects().get(paneId) ?? paneArea();
 
-  const meta: SurfaceMeta = {
-    id: surfaceId,
-    title: cmd.split("/").pop() ?? cmd,
-    command: cmd,
-    status: "idle",
-    unread: false,
-    hasReporter: false,
-    everActive: false,
-    exited: false,
-  };
   setStore(
     produce((s) => {
-      s.surfaces[surfaceId] = meta;
+      s.surfaces[surfaceId] = {
+        id: surfaceId,
+        title: cmd.split("/").pop() ?? cmd,
+        command: cmd,
+        status: "idle",
+        unread: false,
+        hasReporter: false,
+        everActive: false,
+        exited: false,
+      };
     }),
   );
 
-  const rt = new SurfaceRuntime(
-    surfaceId,
-    {
-      command: cmd,
-      args,
-      // A restored cwd may have been deleted since the snapshot.
-      cwd: cwd && existsSync(cwd) ? cwd : process.cwd(),
-      env: surfaceEnv(paneId, surfaceId),
-      cols: rect.width,
-      rows: rect.height - 1,
-    },
-    {
-      onTitle: (title) => {
-        if (title.trim()) {
-          setStore(
-            produce((s) => {
-              const m = s.surfaces[surfaceId];
-              if (m) m.title = title.trim().slice(0, 60);
-            }),
-          );
-        }
-      },
-      onOscNotify: (title, body) => {
-        desktopNotify(
-          surfaceId,
-          title ? `ghosttown · ${title}` : "ghosttown",
-          body || "notification",
-        );
-        applyStatus(surfaceId, "blocked");
-      },
-      onStatusChange: (status) => applyStatus(surfaceId, status),
-      onExit: () => closeSurface(surfaceId),
-    },
-  );
+  const rt = new SurfaceRuntime(surfaceId);
   registry.add(rt);
+  rt.spawn({
+    command: cmd,
+    args,
+    // The host drops a cwd that no longer exists; it may have been deleted
+    // between the snapshot and now.
+    cwd: cwd ?? process.cwd(),
+    env: surfaceEnv(paneId, surfaceId),
+    cols: rect.width,
+    rows: rect.height - 1,
+  });
   return surfaceId;
+}
+
+/**
+ * Take over a surface the pty host is already running — the reload path. The
+ * program keeps running; only the emulator is new, and it is rebuilt from the
+ * host's replay buffer when the renderable mounts.
+ */
+function adoptSurface(info: HostSurfaceInfo): string {
+  setStore(
+    produce((s) => {
+      s.surfaces[info.id] = {
+        id: info.id,
+        title: info.title,
+        command: info.command,
+        status: info.status,
+        unread: false,
+        hasReporter: info.hasReporter,
+        everActive: info.everActive,
+        exited: false,
+        lastActiveAt: info.lastActiveAt ?? undefined,
+      };
+    }),
+  );
+  registry.add(new SurfaceRuntime(info.id));
+  return info.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +326,8 @@ export function initSession(opts: {
   quit: (code: number) => void;
   command?: string;
   args?: string[];
+  /** What the pty host is already running, and the layout that went with it. */
+  boot: { surfaces: HostSurfaceInfo[]; layout: PersistedSession | null };
 }): void {
   socketPath = opts.socketPath;
   onQuit = opts.quit;
@@ -339,45 +338,90 @@ export function initSession(opts: {
       s.sidebar.visible = config.sidebar.visible;
     }),
   );
-
-  // An explicit `gt -- <command>` asks for that command, not for yesterday.
   persistEnabled = config.general.restore_session !== false;
-  const snapshot = persistEnabled && !opts.command ? readSnapshot(opts.session) : null;
-  if (!snapshot || !restoreSession(snapshot)) {
-    createWorkspace({ command: opts.command, args: opts.args });
-  }
 
-  void saveSnapshot();
-  saveInterval = setInterval(() => void saveSnapshot(), SAVE_INTERVAL_MS);
-  tickTimer = setInterval(() => {
-    for (const rt of registry.all()) rt.tracker.tick();
-  }, 500);
+  const live = new Map(opts.boot.surfaces.filter((s) => !s.exited).map((s) => [s.id, s]));
+  // The host holding a layout means the TUI restarted under a live session
+  // (prefix+R, or a --watch reload): adopt it whatever restore_session says,
+  // since those surfaces are still running and dropping them would be worse
+  // than useless. Only a cold start consults the disk snapshot, and an
+  // explicit `gt -- <command>` asks for that command, not for yesterday.
+  let restored = !!opts.boot.layout && restoreSession(opts.boot.layout, live);
+  if (!restored && persistEnabled && !opts.command) {
+    const snapshot = readSnapshot(opts.session);
+    restored = !!snapshot && restoreSession(snapshot, live);
+  }
+  if (!restored) createWorkspace({ command: opts.command, args: opts.args });
+
+  // Surfaces the host has that no pane claimed — one that exited while we were
+  // away, or a layout written before the last split — would otherwise sit there
+  // invisible and unkillable.
+  for (const { id } of opts.boot.surfaces) {
+    if (store.surfaces[id]) continue;
+    dbg("initSession: dropping unclaimed host surface", id);
+    hostSend({ t: "kill", id });
+  }
+  pushLayout();
+}
+
+/**
+ * Host → store plumbing. app.tsx hands this to the host connection; every
+ * surface event the pty host produces lands here.
+ */
+export function hostEvents(): HostEvents {
+  return {
+    onOutput: (id, d) => registry.get(id)?.feed(Buffer.from(d, "base64").toString("utf8")),
+    onSnapshot: (id, d) =>
+      registry.get(id)?.feedSnapshot(Buffer.from(d, "base64").toString("utf8")),
+    onExit: (id) => {
+      if (store.surfaces[id]) closeSurface(id);
+    },
+    onStatus: (id, status, hasReporter) => {
+      if (hasReporter && store.surfaces[id] && !store.surfaces[id]!.hasReporter) {
+        setStore("surfaces", id, "hasReporter", true);
+      }
+      applyStatus(id, status);
+    },
+    onTitle: (id, title) => {
+      setStore(
+        produce((s) => {
+          const m = s.surfaces[id];
+          if (m && title) m.title = title;
+        }),
+      );
+    },
+    onNotify: (id, title, body) => {
+      desktopNotify(id, title ? `ghosttown · ${title}` : "ghosttown", body || "notification");
+      applyStatus(id, "blocked");
+    },
+    onModes: (id, modes) => registry.get(id)?.setMouseModes(modes),
+    onCursorRequest: (id, seq) => registry.get(id)?.answerCursor(seq),
+    onLost: () => {
+      // The surfaces are fine — we just lost our handle on them. Ask the daemon
+      // for a fresh TUI, which reconnects and adopts them; if there is no
+      // daemon, the host died with the process anyway and there is no going back.
+      dbg("pty host connection lost");
+      onQuit(process.env.GHOSTTOWN_ATTACH_SOCKET ? RELOAD_EXIT_CODE : 1);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Persistence — see core/persist.ts for the why and the file format
+// Persistence — the structure is ours, the file is the pty host's
+//
+// The host writes the snapshot (it owns the pids the cwds come from) and keeps
+// the last structure in memory, which is what a restarting TUI boots from. All
+// this side does is hand over the shape of the session whenever it changes.
+// See core/persist.ts for the file format.
 // ---------------------------------------------------------------------------
 
 /** Coalesces bursts (a drag emits a divider change per step). */
-const SAVE_DEBOUNCE_MS = 750;
-/** Continuum-style heartbeat, mostly to notice `cd`s nothing else reports. */
-const SAVE_INTERVAL_MS = 30_000;
+const PUSH_DEBOUNCE_MS = 100;
 
 let persistEnabled = false;
-let savingNow = false;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let saveInterval: ReturnType<typeof setInterval> | null = null;
+let pushTimer: ReturnType<typeof setTimeout> | null = null;
 
-function surfacePids(): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const rt of registry.all()) out.set(rt.id, rt.pty.pid);
-  return out;
-}
-
-function serializeSession(
-  pidBySurface: Map<string, number>,
-  cwds: Map<number, string>,
-): PersistedSession {
+function serializeSession(): PersistedSession {
   return {
     version: SNAPSHOT_VERSION,
     session: store.session,
@@ -398,9 +442,8 @@ function serializeSession(
           return {
             id: paneId,
             activeIdx: pane.activeIdx,
-            surfaces: pane.surfaceIds.map((sid) => ({
-              cwd: cwds.get(pidBySurface.get(sid) ?? -1) ?? null,
-            })),
+            // cwds are filled in host-side, from the pids it owns.
+            surfaces: pane.surfaceIds.map((sid) => ({ id: sid, cwd: null })),
           };
         }),
       };
@@ -408,42 +451,23 @@ function serializeSession(
   };
 }
 
-/**
- * Write the snapshot synchronously. Reserved for the way out (reload), where
- * an awaited read would never come back — reading cwds blocks ~40ms.
- */
-export function saveSnapshotNow(): void {
-  if (saveTimer) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
+/** Hand the current structure to the host, right now. */
+function pushLayoutNow(): void {
+  if (pushTimer) {
+    clearTimeout(pushTimer);
+    pushTimer = null;
   }
-  if (!persistEnabled || store.workspaceOrder.length === 0) return;
-  const pids = surfacePids();
-  writeSnapshot(serializeSession(pids, readCwds([...pids.values()])));
+  if (store.workspaceOrder.length === 0) return;
+  hostSend({ t: "layout", data: serializeSession() });
 }
 
-/** The normal path: nothing blocks the render loop while lsof runs. */
-async function saveSnapshot(): Promise<void> {
-  if (!persistEnabled || savingNow || store.workspaceOrder.length === 0) return;
-  savingNow = true;
-  try {
-    const pids = surfacePids();
-    const cwds = await readCwdsAsync([...pids.values()]);
-    // The layout is read after the await, so it is whatever is on screen now.
-    if (store.workspaceOrder.length > 0) writeSnapshot(serializeSession(pids, cwds));
-  } finally {
-    savingNow = false;
-  }
-}
-
-/** Structural change: save soon, once the burst settles. */
-function scheduleSave(): void {
-  if (!persistEnabled) return;
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    void saveSnapshot();
-  }, SAVE_DEBOUNCE_MS);
+/** Structural change: tell the host once the burst settles. */
+function pushLayout(): void {
+  if (pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    pushTimer = null;
+    pushLayoutNow();
+  }, PUSH_DEBOUNCE_MS);
 }
 
 /** Restored ids are reused verbatim, so fresh ones must start above them. */
@@ -455,11 +479,13 @@ function bumpIdCounter(ids: string[]): void {
 }
 
 /**
- * Rebuild the session from a snapshot: layout, tab order and cwds come back,
- * every surface as a fresh shell. Returns false if nothing usable was in it,
- * leaving the caller to start a normal session.
+ * Rebuild the session from a snapshot: layout, tab order and cwds come back.
+ * A surface that the pty host still has running (`live`) is adopted as it is —
+ * that is the reload path, and the program in it never notices. Anything else
+ * comes back as a fresh shell in its old directory. Returns false if nothing
+ * usable was in the snapshot, leaving the caller to start a normal session.
  */
-function restoreSession(snap: PersistedSession): boolean {
+function restoreSession(snap: PersistedSession, live: Map<string, HostSurfaceInfo>): boolean {
   const workspaces = snap.workspaces.filter((ws) => {
     if (!ws.layout || ws.panes.length === 0) return false;
     // The tree addresses panes by id — drop a workspace that disagrees with
@@ -473,6 +499,8 @@ function restoreSession(snap: PersistedSession): boolean {
   bumpIdCounter([
     ...workspaces.map((ws) => ws.id),
     ...workspaces.flatMap((ws) => ws.panes.map((p) => p.id)),
+    // Adopted surfaces keep their ids, so fresh ones must not collide.
+    ...workspaces.flatMap((ws) => ws.panes.flatMap((p) => p.surfaces.map((s) => s.id ?? ""))),
   ]);
   // "workspace 3" stays workspace 3; the next new one continues from there.
   workspaceNameCounter = workspaces.length;
@@ -504,9 +532,14 @@ function restoreSession(snap: PersistedSession): boolean {
   for (const ws of workspaces) {
     for (const pane of ws.panes) {
       // A pane always owns at least one surface, or it could never be closed.
-      const surfaces = pane.surfaces.length > 0 ? pane.surfaces : [{ cwd: null }];
+      const surfaces =
+        pane.surfaces.length > 0 ? pane.surfaces : [{ id: "", cwd: null }];
       for (const surface of surfaces) {
-        const surfaceId = spawnSurface(pane.id, undefined, [], surface.cwd ?? undefined);
+        const running = surface.id ? live.get(surface.id) : undefined;
+        const surfaceId = running
+          ? adoptSurface(running)
+          : spawnSurface(pane.id, undefined, [], surface.cwd ?? undefined);
+        live.delete(surfaceId);
         setStore(
           produce((s) => {
             s.panes[pane.id]!.surfaceIds.push(surfaceId);
@@ -548,7 +581,7 @@ export function createWorkspace(opts: { name?: string; command?: string; args?: 
     }),
   );
   syncSizes();
-  scheduleSave();
+  pushLayout();
   return wsId;
 }
 
@@ -559,14 +592,14 @@ export function switchWorkspace(wsId: string): void {
   const pane = store.panes[ws.focusedPaneId];
   const active = pane?.surfaceIds[pane.activeIdx];
   if (active) clearUnread(active);
-  scheduleSave();
+  pushLayout();
 }
 
 export function renameWorkspace(wsId: string, name: string): void {
   const trimmed = name.trim().slice(0, 40);
   if (!trimmed || !store.workspaces[wsId]) return;
   setStore("workspaces", wsId, "name", trimmed);
-  scheduleSave();
+  pushLayout();
 }
 
 /** Kill every surface in the workspace and remove it. Refuses on the last one. */
@@ -609,7 +642,7 @@ function removeEmptyWorkspace(wsId: string): void {
     return;
   }
   syncSizes();
-  scheduleSave();
+  pushLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +690,7 @@ function applyDivider(
     }),
   );
   syncSizes();
-  scheduleSave();
+  pushLayout();
 }
 
 /** Resize-mode step: move the focused pane's nearest divider on that axis. */
@@ -701,7 +734,7 @@ export function splitPane(paneId: string, dir: SplitDir, command?: string, args?
     }),
   );
   syncSizes();
-  scheduleSave();
+  pushLayout();
   return newPaneId;
 }
 
@@ -717,7 +750,7 @@ export function newTab(paneId: string, command?: string, args?: string[]): strin
     }),
   );
   clearUnread(surfaceId);
-  scheduleSave();
+  pushLayout();
   return surfaceId;
 }
 
@@ -730,7 +763,7 @@ export function selectTab(paneId: string, idx: number): void {
     }),
   );
   clearUnread(pane.surfaceIds[idx]!);
-  scheduleSave();
+  pushLayout();
 }
 
 export function cycleTab(paneId: string, delta: number): void {
@@ -754,7 +787,7 @@ export function focusPane(paneId: string): void {
   const pane = store.panes[paneId]!;
   const active = pane.surfaceIds[pane.activeIdx];
   if (active) clearUnread(active);
-  scheduleSave();
+  pushLayout();
 }
 
 /**
@@ -777,7 +810,7 @@ function revealSurface(surfaceId: string, focus: boolean): void {
       }),
     );
     clearUnread(surfaceId);
-    scheduleSave();
+    pushLayout();
     return;
   }
 }
@@ -830,7 +863,7 @@ export function closeSurface(surfaceId: string): void {
     }),
   );
   if (emptyPaneId) closePane(emptyPaneId);
-  else scheduleSave();
+  else pushLayout();
 }
 
 function closePane(paneId: string): void {
@@ -857,7 +890,7 @@ function closePane(paneId: string): void {
     return;
   }
   syncSizes();
-  scheduleSave();
+  pushLayout();
   const ws = store.workspaces[wsId]!;
   const pane = store.panes[ws.focusedPaneId];
   const active = pane?.surfaceIds[pane.activeIdx];
@@ -892,7 +925,7 @@ export function toggleSidebar(): void {
     }),
   );
   syncSizes();
-  scheduleSave();
+  pushLayout();
 }
 
 export function focusSidebar(): void {
@@ -1114,6 +1147,16 @@ export function forceRedraw(): void {
   onRedraw();
 }
 
+/**
+ * The config file changed on disk and the cache has been dropped. Values read
+ * at use time (pane_gap, sidebar width, keybinds) are already live; the pane
+ * geometry they feed has to be recomputed.
+ */
+export function applyConfigChange(): void {
+  syncSizes();
+  forceRedraw();
+}
+
 export function setPrefixArmed(armed: boolean): void {
   setStore("prefixArmed", armed);
 }
@@ -1122,7 +1165,7 @@ export function setHelpVisible(visible: boolean): void {
   setStore("helpVisible", visible);
 }
 
-/** Explicit status report from `gt report` (authoritative). */
+/** Explicit status report from `gt report` (authoritative, applied host-side). */
 export function reportStatus(surfaceId: string, status: AgentStatus): boolean {
   const rt = registry.get(surfaceId);
   if (!rt || !store.surfaces[surfaceId]) return false;
@@ -1131,7 +1174,7 @@ export function reportStatus(surfaceId: string, status: AgentStatus): boolean {
       s.surfaces[surfaceId]!.hasReporter = true;
     }),
   );
-  rt.tracker.report(status);
+  rt.report(status);
   return true;
 }
 
@@ -1172,31 +1215,28 @@ export function snapshot(): SessionSnapshot {
 
 /** Kill ghosttown and everything inside it (surfaces, daemon, clients). */
 export function quit(): void {
-  if (tickTimer) clearInterval(tickTimer);
-  if (saveInterval) clearInterval(saveInterval);
-  if (saveTimer) clearTimeout(saveTimer);
-  // Quitting is a decision, not an accident — don't resurrect this session,
-  // and make sure no save in flight writes the file back.
+  if (pushTimer) clearTimeout(pushTimer);
+  // Quitting is a decision, not an accident: the host drops the snapshot and
+  // kills every surface, so nothing gets resurrected next time.
   persistEnabled = false;
-  deleteSnapshot(store.session);
+  hostSend({ t: "quit" });
   registry.disposeAll();
   onQuit(0);
 }
 
 /**
  * Dev reload: exit with the magic code — the daemon respawns the TUI from the
- * current source. The surface PTYs are children of this process, so they die
- * with it; the respawned TUI rebuilds the layout from the snapshot we write
- * here (fresh cwds and all). No-op when not under a daemon. Clears the cached
- * config so the reloaded instance picks up fresh changes.
+ * current source. The surfaces are NOT ours to lose: they live in the daemon's
+ * pty host and are adopted again on the way back up, so whatever is running in
+ * them (agents included) keeps running across the reload. All we do here is
+ * make sure the host has the current layout. No-op when not under a daemon.
  */
 export function reloadApp(): void {
   if (!process.env.GHOSTTOWN_ATTACH_SOCKET) return;
-  if (tickTimer) clearInterval(tickTimer);
-  if (saveInterval) clearInterval(saveInterval);
-  saveSnapshotNow();
+  pushLayoutNow();
   setConfigForTest(null);
-  onQuit(RELOAD_EXIT_CODE);
+  // A beat for the layout frame to reach the host before the socket dies.
+  setTimeout(() => onQuit(RELOAD_EXIT_CODE), 50);
 }
 
 /** Fire-and-forget a command frame at our own attach daemon. */

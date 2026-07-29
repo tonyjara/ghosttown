@@ -106,8 +106,26 @@ function dispatch(method: string, params: Record<string, unknown>): unknown {
   }
 }
 
-/** Ensure the socket dir exists and the path is free (or stale → removed). */
-export async function prepareSocketPath(session: string): Promise<string> {
+/**
+ * Ensure the socket dir exists and the path is free (or stale → removed).
+ *
+ * Retried, because a restarting TUI (prefix+R, or a `bun --watch` reload) can
+ * start before the socket of the instance it replaces has closed — and giving
+ * up there would take the whole session down over a few milliseconds.
+ */
+export async function prepareSocketPath(session: string, tries = 4): Promise<string> {
+  for (let i = 1; ; i++) {
+    try {
+      return await claimSocketPath(session);
+    } catch (err) {
+      if (i >= tries) throw err;
+      dbg("control socket busy, retrying", i);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+}
+
+async function claimSocketPath(session: string): Promise<string> {
   const dir = defaultSocketDir();
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = socketPathFor(session);

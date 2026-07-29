@@ -215,6 +215,18 @@ async function main(): Promise<void> {
   pty.write("printf '\\033[?1000l\\033[?1006l'\r");
   await sleep(600);
 
+  // --- Cursor position report ---
+  // The scanner lives in the pty host, the emulator lives in the TUI, so a
+  // DSR 6n has to round-trip between processes. `ABC` leaves the cursor in
+  // column 4, which is what the answer must say (a fallback would say 1).
+  pty.write("printf 'ABC'; printf '\\033[6n'; cat -v\r");
+  await sleep(1000);
+  text = term.getText();
+  console.log(frame("cursor query answered"));
+  expect("cursor query answered from the emulator", /\^\[\[\d+;4R/.test(text));
+  pty.write("\x03");
+  await sleep(400);
+
   // Split right.
   pty.write(PREFIX);
   await sleep(120);
@@ -554,9 +566,21 @@ async function main(): Promise<void> {
   pty.write(`cd ${cwdMarkerDir}\r`);
   await sleep(800);
 
+  // A shell variable is the proof that matters: only the very same process can
+  // still have it. A fresh shell in the same directory would print nothing.
+  pty.write("SURVIVOR=alive_$$\r");
+  await sleep(600);
+  // ...and a background job whose output must keep landing in this surface
+  // across the reload, which is what an agent left running really does.
+  pty.write("(i=0; while [ $i -lt 40 ]; do echo beat_$i; i=$((i+1)); sleep 1; done) &\r");
+  await sleep(2500);
+  const beatsBefore = [...term.getText().matchAll(/beat_(\d+)/g)].map((m) => Number(m[1]));
+  expect("background job is printing before the reload", beatsBefore.length > 0);
+
   // Reload: prefix+R restarts the TUI from source; daemon + client stay up.
-  // The PTYs die with the old process, but the layout comes back from the
-  // snapshot — workspaces, panes, tabs, and each surface's directory.
+  // The surface PTYs belong to the daemon's pty host, so nothing running in
+  // them is disturbed — the new TUI adopts them and rebuilds its emulators
+  // from the host's replay buffers.
   pty.write(PREFIX);
   await sleep(120);
   pty.write("R");
@@ -565,12 +589,58 @@ async function main(): Promise<void> {
   console.log(frame("after reload"));
   expect("client survives reload", !exited);
   expect("workspaces survive reload", text.includes("WORKSPACES (2)"));
+  expect("scrollback survives reload (replayed)", text.includes("beat_0"));
+  {
+    const after = [...text.matchAll(/beat_(\d+)/g)].map((m) => Number(m[1]));
+    expect(
+      "background job kept running through the reload",
+      after.length > 0 && Math.max(...after) > Math.max(...beatsBefore),
+    );
+  }
+  pty.write('echo "survivor=$SURVIVOR"\r');
+  await sleep(900);
+  text = term.getText();
+  console.log(frame("same shell after reload"));
+  expect("the very same shell survived the reload", /survivor=alive_\d+/.test(text));
   // basename, not pwd: the full temp path is wider than the pane and would
   // wrap straight through the marker.
   pty.write('basename "$PWD"\r');
   await sleep(900);
   text = term.getText();
-  expect("restored surface keeps its directory", text.includes("cwd_marker_dir"));
+  expect("adopted surface keeps its directory", text.includes("cwd_marker_dir"));
+  // Kill the background job so its output stops polluting later frames.
+  pty.write("kill %1 2>/dev/null; wait 2>/dev/null\r");
+  await sleep(600);
+
+  // --- Config hot reload -------------------------------------------------
+  // Saving the config applies it in place: no reload, no restart, and the
+  // surfaces (which the pty host owns) replay into the remounted UI.
+  writeFileSync(
+    configPath,
+    `[appearance]\ntheme = "gruvbox"\n\n[keybinds]\n"new-tab" = ["y"]\n`,
+  );
+  await sleep(2000);
+  text = term.getText();
+  console.log(frame("after config save"));
+  {
+    const bgs = new Set<string>();
+    for (const l of term.getJson().lines) {
+      for (const s of l.spans) if (s.bg) bgs.add(s.bg.toLowerCase());
+    }
+    expect("saved theme reaches the screen without a reload", bgs.has("#282828"));
+  }
+  expect("surfaces survive the config remount", text.includes("cwd_marker_dir"));
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("y");
+  await sleep(1500);
+  text = term.getText();
+  console.log(frame("after rebound new-tab"));
+  expect("rebound keys work without a reload", text.includes("2:"));
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("D");
+  await sleep(1000);
 
   // Back to workspace 1 (two panes, one of them with two tabs).
   click(5, 3);

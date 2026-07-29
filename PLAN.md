@@ -33,8 +33,9 @@ These keep the design portable (e.g. a future Rust port) and honest:
    `GhosttyTerminalRenderable` buffer path. Per-frame cell data never touches
    the reconciler.
 4. **Core is UI-agnostic.** `src/core/` (layout tree, surface lifecycle, status
-   engine, query responder) imports nothing from `src/ui/`. The daemon/client
-   split in phase 2 cuts along this seam.
+   engine, query responder) imports nothing from `src/ui/`. The daemon/TUI split
+   cut along this seam, and the daemon must stay that way: it imports no
+   solid/opentui, so a UI-side error can never take the surfaces down with it.
 5. **Status is hook-first, heuristic-fallback.** Explicit agent reports (Claude
    Code hooks → `gt report`) are authoritative. Output-activity heuristics are
    the fallback for anything without hooks. Never scrape spinner text.
@@ -54,14 +55,22 @@ Host kitty-keyboard is deliberately **disabled** (`useKittyKeyboard: null`) so
 Child apps that *query* for kitty protocol get "not supported" — they degrade
 gracefully. Proper KKP passthrough is a phase-3 differentiator.
 
-## Architecture (MVP: single process)
+## Architecture (model in the daemon, view in the TUI)
 
 ```
-┌──────────────────────── gt (TUI process) ───────────────────────┐
+    gt (attach client: raw bytes ⇄ tty)
+                │  <session>.attach.sock
+┌───────────────▼──── daemon (owns the session) ───────────────────┐
+│  attach/daemon    PTY running the TUI · client fan-out · modes    │
+│  attach/ptyhost   THE SURFACES: pty per surface · query responder │
+│                   · OSC observer · status engine · replay buffer  │
+│                   · layout snapshot on disk                      │
+└───────────────▲──────────────────────────────────────────────────┘
+                │  <session>.host.sock   (spawn/sub/w/resize/kill ⇄ o/snap/status)
+┌───────────────▼──── gt __tui (the view, restartable) ────────────┐
 │  ui/          Solid components: App, PaneView, TabStrip, StatusBar│
-│  core/        layout tree · surface runtime (PTY+VT) · status    │
-│               engine · query responder · OSC observer            │
-│  control/     Unix socket server (JSON lines)                    │
+│  core/        layout tree · surface proxies · store               │
+│  control/     Unix socket server (JSON lines)                     │
 └───────────────▲──────────────────────────────────────────────────┘
                 │ GHOSTTOWN_SOCKET
         gt CLI (report/notify/split/new-tab/send-text/read-screen)
@@ -69,10 +78,19 @@ gracefully. Proper KKP passthrough is a phase-3 differentiator.
         Claude Code hooks (UserPromptSubmit/PreToolUse/Stop/Notification)
 ```
 
-Data flow per surface: `pty.onData → query-responder (answers DSR/DA1/OSC 10/11
-back to the pty) → OSC observer (title, OSC 9 notifications) → status tracker →
-GhosttyTerminalRenderable.feed()`. Input: parsed `KeyEvent` → prefix state
-machine → either a mux action or `pty.write(key.raw)`.
+The split is what makes the TUI disposable: `prefix R` (or a `bun --watch`
+restart under `GHOSTTOWN_DEV=1`) replaces the view while the model keeps
+running, and the new view adopts each surface by id.
+
+Data flow per surface, host-side: `pty.onData → query-responder (answers
+DSR/DA1/OSC 10/11 back to the pty) → OSC observer (title, OSC 9) → status
+tracker → replay buffer → `o` frame`. TUI-side: `o` frame →
+`GhosttyTerminalRenderable.feed()`. Input: parsed `KeyEvent` → prefix state
+machine → either a mux action or a `w` frame the host writes to the pty.
+
+The one thing the host cannot answer alone is DSR 6n: only the view has an
+emulator, so a cursor query becomes a `cpr-req`/`cpr` round trip (falling back
+to the last known cursor if no view is attached — the reload window).
 
 Layout is a binary split tree; rects are computed manually from terminal
 dimensions (deterministic cols/rows for `pty.resize`), panes are
@@ -123,7 +141,7 @@ explicit signals, never guessed from text).
 | `r` | resize mode: h/j/k/l move the divider, esc leaves |
 | `s` / `S` | switch profile / new profile (sessions; old one keeps running) |
 | `d` | detach — session keeps running in the daemon |
-| `R` (shift+r) | reload the TUI from source (dev loop) |
+| `R` (shift+r) | reload the TUI from source (dev loop; panes keep running) |
 | `Q` (shift+q) | kill ghosttown and everything inside it |
 
 Mouse: click pane → focus; click tab → select; click the sidebar → focus it
@@ -147,22 +165,31 @@ scrollback).
   `bye reason:"switch"` and the attach client re-enters its connect loop
   against the target session, spawning that daemon if needed; the old
   session keeps running detached).
-- ~~Session snapshots~~ (shipped: `src/core/persist.ts` writes the layout —
-  workspaces, split ratios, panes, tab order, per-surface cwd — to
-  `$XDG_STATE_HOME/ghosttown/<session>.session.json` on structural changes
-  and every 30s; `initSession` rebuilds from it, so reload, a TUI crash and a
-  reboot all come back. Processes are not restored: a restored surface is a
-  fresh shell in its old directory. An explicit quit/kill drops the snapshot).
+- ~~Session snapshots~~ (shipped: the layout — workspaces, split ratios, panes,
+  tab order, per-surface id and cwd — goes to
+  `$XDG_STATE_HOME/ghosttown/<session>.session.json`. The TUI serializes the
+  structure and the pty host writes the file, since it owns the pids the cwds
+  come from; on structural changes and every 30s. Consulted only on a *cold*
+  start now, where a restored surface is a fresh shell in its old directory. An
+  explicit quit/kill drops the snapshot).
+- ~~Surfaces in the daemon~~ (shipped as `src/attach/ptyhost.ts`: the daemon
+  owns every surface pty, the scanner, the status engine and a bounded raw
+  replay buffer; the TUI is a client over `<session>.host.sock` and adopts live
+  surfaces by id on start. Reload and `--watch` restarts keep the processes,
+  and the disk snapshot dropped from being the reload mechanism to being the
+  crash/reboot fallback.
+  Two deviations from the original sketch: no headless `PersistentTerminal` in
+  the daemon — a cursor query round-trips to the TUI instead, which is both
+  cheaper and more accurate — and surface frames got their own socket rather
+  than sharing the attach socket, which carries the outer terminal's bytes.
+  Replay is trimmed to whole chunks and re-opened at an escape boundary, with
+  the private modes it trimmed away replayed as a prelude.)
+- ~~Config hot reload~~ (shipped: the config files are watched; a save
+  re-merges them, re-resolves the theme in place and remounts the UI. Safe
+  because a remount no longer costs anything — the surfaces are the host's and
+  replay into the new emulators).
 - **Phase 2 — remaining persistence:** scrollback view + search,
   worktree-per-agent helper (`gt new --worktree`).
-- **Phase 2.5 — the real fix for reload:** move the surface PTYs into the
-  daemon so it owns the model and the TUI is only a view. Reload then keeps
-  the processes themselves (today it only rebuilds the layout around new
-  shells), and a TUI crash costs nothing. Needs: a surface manager + headless
-  `PersistentTerminal` per surface in the daemon (the query responder needs a
-  cursor, see `runtime.ts`), surface I/O frames on the attach socket, and a
-  bounded raw-output ring buffer replayed into the fresh renderable —
-  ghostty exposes no screen serializer, only `getText`/`getJson`.
 - **Phase 3 — the flexes:** kitty keyboard passthrough (per-child re-encoding),
   DECRQM/mode mirroring per pane, remote attach over SSH,
   `bun build --compile` single-binary releases.

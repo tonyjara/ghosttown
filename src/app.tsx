@@ -3,9 +3,15 @@
  * the control socket, and the renderer.
  */
 import { render, useRenderer } from "@opentui/solid";
+import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import type { CliRenderer } from "@opentui/core";
 import { unlinkSync } from "node:fs";
-import { initSession, quit, setRedrawHandler } from "./core/state";
+import { loadConfig, reloadConfig, watchConfig } from "./core/config";
+import { dbg } from "./core/debug";
+import { applyConfigChange, hostEvents, initSession, setRedrawHandler } from "./core/state";
+import { refreshTheme } from "./ui/theme";
+import { setHostSender } from "./core/runtime";
+import { connectHostInProcess, connectHostSocket, type HostConnection } from "./control/hostclient";
 import { startControlServer, prepareSocketPath } from "./control/server";
 import { App } from "./ui/App";
 
@@ -53,6 +59,29 @@ function shutdown(code: number): never {
 
 function Root() {
   renderer = useRenderer();
+  /**
+   * The UI is torn down and rebuilt on a config save. Keybinds and geometry are
+   * read at use time and are already live by then, but colors are baked into
+   * renderables when they are constructed, so new theme values only reach the
+   * screen through fresh ones. It costs a repaint and nothing more: the
+   * surfaces belong to the pty host and replay into the new emulators.
+   *
+   * Off-then-on rather than a keyed swap — a truthy→truthy change builds the
+   * new tree without ever attaching it, leaving the old one on screen.
+   */
+  const [uiMounted, setUiMounted] = createSignal(true);
+  onMount(() => {
+    const stop = watchConfig(() => {
+      dbg("config changed on disk; reapplying");
+      reloadConfig();
+      refreshTheme();
+      applyConfigChange();
+      setUiMounted(false);
+      setTimeout(() => setUiMounted(true), 0);
+    });
+    onCleanup(stop);
+  });
+
   setRedrawHandler(() => {
     // Private flag (pinned @opentui/core 0.4.5): the diff renderer's only
     // full-frame switch. Needed when a detached client reattaches to a
@@ -65,7 +94,30 @@ function Root() {
     r.forceFullRepaintRequested = true;
     r.requestRender?.();
   });
-  return <App />;
+  // The Show sits inside a box on purpose: at the very root of the render tree
+  // a dynamic child is inserted once and never reconciled.
+  return (
+    <box width="100%" height="100%">
+      <Show when={uiMounted()}>
+        <App />
+      </Show>
+    </box>
+  );
+}
+
+/**
+ * Reach the pty host that owns the surface PTYs. Normally that is the daemon's
+ * (which is what makes a TUI restart survivable); with GHOSTTOWN_NO_DAEMON=1
+ * there is no daemon to hold anything, so one runs in this process and dies
+ * with it.
+ */
+async function connectPtyHost(session: string, persist: boolean): Promise<HostConnection> {
+  const events = hostEvents();
+  if (process.env.GHOSTTOWN_ATTACH_SOCKET || process.env.GHOSTTOWN_HOST_SOCKET) {
+    return await connectHostSocket({ session, persist, events });
+  }
+  const { createPtyHost } = await import("./attach/ptyhost");
+  return connectHostInProcess({ host: createPtyHost({ session }), persist, events });
 }
 
 export async function startApp(opts: {
@@ -81,18 +133,25 @@ export async function startApp(opts: {
   const socketPath = await prepareSocketPath(opts.session);
   socketPathForCleanup = socketPath;
 
+  const persist = loadConfig().general.restore_session !== false;
+  const host = await connectPtyHost(opts.session, persist);
+  setHostSender(host.send);
+
   initSession({
     session: opts.session,
     socketPath,
     quit: (code) => shutdown(code),
     command: opts.command,
     args: opts.args,
+    boot: host.boot,
   });
   startControlServer(socketPath);
 
-  // The daemon SIGTERMs us when the session is killed — same deal as
-  // prefix+Q, so tear down properly (surfaces, snapshot) instead of vanishing.
-  process.on("SIGTERM", () => quit());
+  // Being signalled is NOT a decision to end the session: `bun --watch` kills
+  // us on every source change, and the daemon does its own teardown (surfaces,
+  // snapshot) when a kill is what was actually meant. So just leave quietly
+  // and let the surfaces outlive us. prefix+Q is the path that means quit.
+  process.on("SIGTERM", () => shutdown(0));
 
   await render(() => <Root />, {
     exitOnCtrlC: false,

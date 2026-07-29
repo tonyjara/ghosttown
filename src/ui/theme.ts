@@ -19,8 +19,16 @@ export function resolveTheme(config: Config): Theme {
   return out;
 }
 
-/** Resolved once at startup; prefix+R (reload) picks up config changes. */
+/**
+ * The live theme. Updated *in place* so every `theme.x` read stays valid —
+ * opentui bakes colors into renderables when they are constructed, so a config
+ * change also remounts the UI (see app.tsx) to make new colors take effect.
+ */
 export const theme: Theme = resolveTheme(loadConfig());
+
+export function refreshTheme(): void {
+  Object.assign(theme, resolveTheme(loadConfig()));
+}
 
 export function statusGlyph(status: AgentStatus): { glyph: string; color: string } {
   switch (status) {

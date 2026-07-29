@@ -14,11 +14,22 @@ import { applyMouseMode, mouseModeState, MOUSE_MODES_OFF, type MouseModes } from
 
 const MAX_CARRY = 4096;
 
+/** CPR answer for a 0-based cursor — the deferred path builds it by hand. */
+export function cursorReport(priv: string, x: number, y: number): string {
+  return `\x1b[${priv === "?" ? "?" : ""}${y + 1};${x + 1}R`;
+}
+
 export interface ScannerHooks {
   /** Write a response back to the child PTY. */
   respond: (data: string) => void;
   /** Current cursor position as [x, y], 0-based. */
   getCursor: () => [number, number];
+  /**
+   * Answer a cursor position report out of band. Returning true means "I will
+   * respond myself, later" and suppresses the synchronous answer — the pty
+   * host uses it to ask the TUI (which owns the emulator) over the socket.
+   */
+  deferCursorReport?: (priv: string) => boolean;
   onTitle?: (title: string) => void;
   onNotify?: (title: string, body: string) => void;
 }
@@ -71,9 +82,10 @@ export class OutputScanner {
     const seq = m[0];
     const { respond } = this.hooks;
     if (seq.endsWith("6n")) {
-      const [x, y] = this.hooks.getCursor();
       const priv = m[1] === "?" ? "?" : "";
-      respond(`\x1b[${priv}${y + 1};${x + 1}R`);
+      if (this.hooks.deferCursorReport?.(priv)) return;
+      const [x, y] = this.hooks.getCursor();
+      respond(cursorReport(priv, x, y));
     } else if (seq === "\x1b[5n") {
       respond("\x1b[0n");
     } else if (seq === "\x1b[c" || seq === "\x1b[0c") {

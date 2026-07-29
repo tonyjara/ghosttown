@@ -4,6 +4,9 @@
 # (also honored: $XDG_CONFIG_HOME/ghosttown/config.toml, or any file via
 # $GHOSTTOWN_CONFIG). Your file always wins over the shipped defaults.
 #
+# Saving the file applies it immediately — no reload, no restart, and nothing
+# running in a pane is disturbed.
+#
 # Tip: your copy only needs the values you change — deleting the rest lets
 # future ghosttown default changes flow through. Keybind lists replace the
 # default list for that action (they don't append).
@@ -14,11 +17,15 @@ shell = ""
 # Session name when `gt` is started without --session.
 session = "main"
 # Keep a layout snapshot (workspaces, splits, tabs, each surface's directory)
-# and rebuild from it when a session starts — after a reload, a crash, or a
-# reboot. Restored surfaces are fresh shells in their old directory; programs
-# that were running are not restarted. `prefix Q` drops the snapshot, so an
-# explicit quit always starts clean. Snapshots live in
-# $XDG_STATE_HOME/ghosttown (~/.local/state/ghosttown).
+# and rebuild from it when a session starts cold — after a crash or a reboot.
+# Restored surfaces are fresh shells in their old directory; programs that were
+# running are not restarted. `prefix Q` drops the snapshot, so an explicit quit
+# always starts clean. Snapshots live in $XDG_STATE_HOME/ghosttown
+# (~/.local/state/ghosttown).
+#
+# This does not apply to a reload (prefix R): the surfaces belong to the
+# background daemon, so they are still running and get adopted as they are,
+# whatever this is set to.
 restore_session = true
 
 [appearance]
@@ -85,8 +92,10 @@ prefix = "ctrl+a"
 # Reattach with plain `gt` (or `gt --session <name>`).
 "detach" = ["d"]
 # The next two are deliberately shifted so a stray keystroke can't fire them.
-# Reload: restart the TUI from the current source (dev loop). The TUI owns the
-# surface PTYs, so they are killed and respawned with it — layout included.
+# Reload: restart the TUI from the current source (dev loop). Everything running
+# in the panes keeps running — the PTYs belong to the background daemon, not to
+# the TUI — so this costs a repaint and nothing else. (While developing,
+# GHOSTTOWN_DEV=1 does the same thing automatically on every file save.)
 "reload" = ["R"]
 # Kill ghosttown completely: every tab, workspace, client, and the daemon.
 "quit" = ["Q"]

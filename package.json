@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "bun --conditions=browser run src/index.ts",
-    "dev": "bun --conditions=browser run --watch src/index.ts",
+    "dev": "GHOSTTOWN_DEV=1 bun --conditions=browser run src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "harness": "bun run scripts/harness.ts"

@@ -4,6 +4,11 @@
  * clients drop, the TUI keeps running here. TUI exit 42 = respawn with fresh
  * code (dev reload); any other exit tears the session down.
  *
+ * It also hosts the surface PTYs (src/attach/ptyhost.ts). That is what makes
+ * reloading cheap: the TUI can be restarted — by prefix+R, or by `bun --watch`
+ * under GHOSTTOWN_DEV=1 — and the shells and agents in the panes keep running,
+ * to be adopted again by the TUI that comes back up.
+ *
  * Deliberately lean: no solid/opentui imports — the TUI child does the UI.
  */
 import { spawn, type IPty } from "bun-pty";
@@ -12,6 +17,7 @@ import { join } from "node:path";
 import {
   attachSocketPathFor,
   defaultSocketDir,
+  hostSocketPathFor,
   socketPathFor,
   RELOAD_EXIT_CODE,
   type AttachClientFrame,
@@ -19,6 +25,7 @@ import {
 } from "../control/protocol";
 import { SocketWriter } from "../control/sockbuf";
 import { deleteSnapshot } from "../core/persist";
+import { createPtyHost, listenPtyHost } from "./ptyhost";
 
 export interface DaemonOpts {
   session: string;
@@ -99,6 +106,9 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
   let rows = Math.max(2, opts.rows);
   let tui: IPty | null = null;
   let shuttingDown = false;
+  // Outlives every TUI in this session: the surfaces belong to it, not to the UI.
+  const host = createPtyHost({ session: opts.session, log });
+  const hostPath = listenPtyHost(host, opts.session);
   const clients = new Set<Sock>();
   // DECSET/DECRST private modes the TUI has toggled (alt screen, mouse,
   // cursor…), replayed to late-attaching clients so their terminal matches.
@@ -156,6 +166,10 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
     // to run its handler — and a daemon *crash* must leave the snapshot
     // alone, which is exactly why this lives here and not in the signal path.
     if (reason === "killed") deleteSnapshot(opts.session);
+    // A TUI that exited on its own may have moved things since the last
+    // 30s heartbeat; catch up before the pids are gone.
+    else host.flushSnapshotSync();
+    host.closeAll();
     broadcast({ t: "bye", reason });
     setTimeout(() => {
       for (const c of clients) {
@@ -170,10 +184,12 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
       } catch {
         // already dead
       }
-      try {
-        unlinkSync(attachPath);
-      } catch {
-        // already removed
+      for (const path of [attachPath, hostPath]) {
+        try {
+          unlinkSync(path);
+        } catch {
+          // already removed
+        }
       }
       process.exit(0);
     }, 100);
@@ -182,7 +198,13 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
   const spawnTui = (): void => {
     modes.clear();
     modeTail = "";
-    const args = ["--conditions=browser", "run", entry, "__tui", "--session", opts.session];
+    const args = ["--conditions=browser", "run"];
+    // GHOSTTOWN_DEV=1: bun restarts the TUI itself whenever a source file
+    // changes (and survives a crash until the next save). The surfaces are the
+    // host's, so a reload costs a repaint and nothing else — this is the whole
+    // point of moving them out of the TUI.
+    if (process.env.GHOSTTOWN_DEV === "1") args.push("--watch");
+    args.push(entry, "__tui", "--session", opts.session);
     if (opts.command) args.push("--", opts.command, ...(opts.args ?? []));
     log("spawning tui", { cols, rows, args });
     tui = spawn(process.execPath, args, {
@@ -190,7 +212,11 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
       cols,
       rows,
       cwd: process.cwd(),
-      env: { ...cleanEnv(), GHOSTTOWN_ATTACH_SOCKET: attachPath },
+      env: {
+        ...cleanEnv(),
+        GHOSTTOWN_ATTACH_SOCKET: attachPath,
+        GHOSTTOWN_HOST_SOCKET: hostPath,
+      },
     });
     tui.onData((chunk) => {
       trackModes(chunk);

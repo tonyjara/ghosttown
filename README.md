@@ -61,7 +61,7 @@ emulation, renderer) ship prebuilt — no toolchain needed.
 | `s` | **switch profile** — pick another running session |
 | `S` (shift+s) | **new profile** — name a fresh session and jump there |
 | `d` | detach — the session keeps running in the background |
-| `R` (shift+r) | reload the TUI from source (dev loop; layout restored, shells restart) |
+| `R` (shift+r) | reload the TUI from source (dev loop; panes keep running) |
 | `Q` (shift+q) | kill ghosttown and everything inside it |
 | `?` | floating help pane with the effective keybinds |
 | `Ctrl+A` again | send a literal Ctrl+A |
@@ -74,22 +74,31 @@ Profiles are sessions: switching jumps this terminal to another session's
 daemon (starting it if needed) while the current one keeps running detached —
 `gt --session <name>` reattaches to any of them later.
 
+### Reload keeps your panes
+
+The surface PTYs belong to the background daemon, not to the TUI. So the TUI is
+disposable: `prefix R` restarts it from the current source and every shell and
+agent keeps running — the new instance adopts them by id and rebuilds its
+emulators from the daemon's replay buffers (last 512 KB of output per surface,
+`$GHOSTTOWN_REPLAY_BYTES` to change). What a reload costs is a repaint.
+
+Detaching is the same story from the other side: the session is still running,
+you just stopped looking at it.
+
 ### Session snapshots
 
-Detaching keeps everything alive — the session is still running, you just
-stopped looking at it. Reload, a crash, or a reboot are different: the TUI
-process owns every surface PTY, so they go down with it.
-
-For those, ghosttown keeps a snapshot of the *structure* in
-`~/.local/state/ghosttown/<session>.session.json`, written whenever the
-layout changes and every 30s after that. On the next start it rebuilds
+A crash or a reboot does take the panes with it. For those, ghosttown keeps a
+snapshot of the *structure* in
+`~/.local/state/ghosttown/<session>.session.json`, written whenever the layout
+changes and every 30s after that. On the next *cold* start it rebuilds
 workspaces, split ratios, panes, tab order, and drops each surface back in the
 directory it was in. Programs are **not** restarted — a restored surface is a
 fresh shell, so a `claude` tab comes back as a prompt in the right repo.
 
 `prefix Q` (and `gt kill`) deletes the snapshot: quitting is a decision, so
 the next start is clean. Turn the whole thing off with `restore_session =
-false` under `[general]`.
+false` under `[general]` — reload still adopts live panes either way, since
+nothing needs restoring there.
 
 ### Sidebar
 
@@ -119,6 +128,10 @@ Your file always wins over the shipped defaults. It only *needs* the values
 you change — trimming it to just those lets future default changes flow
 through. `$GHOSTTOWN_CONFIG` points at an alternate file, `$XDG_CONFIG_HOME`
 is respected.
+
+**Saving applies it.** The file is watched: keybinds, theme, gaps and sidebar
+width take effect on write, with no reload and no interruption to anything
+running in a pane.
 
 ```toml
 # ~/.config/ghosttown/config.toml
@@ -182,11 +195,18 @@ gt notify "deploy finished"      # desktop notification
 ## Development
 
 ```sh
-bun test                # unit tests (layout, VT queries, status engine)
+bun run dev             # live reload: the TUI restarts on save, panes keep running
+bun test                # unit tests (layout, VT queries, status engine, pty host)
 bun run harness         # headless end-to-end: drives the real TUI in a PTY
 bun run typecheck
 GHOSTTOWN_DEBUG_LOG=/tmp/gt.log bun run start   # capture errors/tracing
 ```
 
+`bun run dev` is `GHOSTTOWN_DEV=1`, which makes the daemon run the TUI under
+`bun --watch`. Save a file and the UI comes back a moment later with your
+change; the shells and agents in the panes are untouched, because they are the
+daemon's. A save that doesn't compile just leaves the UI down until the next
+one — the session (and everything running in it) survives.
+
 See `PLAN.md` for architecture, design principles, and the roadmap
-(phase 2: daemon split + detach/reattach, scrollback, worktree-per-agent).
+(phase 2: scrollback view + search, worktree-per-agent).
