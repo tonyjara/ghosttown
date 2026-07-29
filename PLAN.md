@@ -115,24 +115,57 @@ explicit signals, never guessed from text).
 |---|---|
 | `\|` / `-` | split right / down |
 | `h j k l` / arrows | focus pane by direction |
-| `c` | new tab in focused pane |
+| `T` (shift+t) | new tab in focused pane |
 | `n` / `p` | next / previous tab |
 | `1`–`9` | select tab N |
-| `x` | close tab (pane closes with last tab) |
-| `q` | quit session |
+| `D` (shift+d) | close tab (pane closes with last tab) |
+| `C` / `X` (shift) | new / delete workspace |
+| `r` | resize mode: h/j/k/l move the divider, esc leaves |
+| `s` / `S` | switch profile / new profile (sessions; old one keeps running) |
+| `d` | detach — session keeps running in the daemon |
+| `R` (shift+r) | reload the TUI from source (dev loop) |
+| `Q` (shift+q) | kill ghosttown and everything inside it |
 
-Mouse: click pane → focus; click tab → select; scroll → (phase 2: scrollback).
+Mouse: click pane → focus; click tab → select; click the sidebar → focus it
+on that row; drag the gap between panes → resize; scroll → (phase 2:
+scrollback).
 
 ## Roadmap
 
-- **Phase 2 — daemon split & persistence:** move `core/` + PTYs into a
-  `gt daemon` process (the socket protocol already exists); `gt attach`,
-  detach on client death, session restore. Scrollback view + search.
-  Interactive pane resize. Config file. Worktree-per-agent helper
-  (`gt new --worktree`).
+- ~~Config file~~ (shipped), ~~workspaces (multiple layouts)~~ (shipped, with
+  the profile→workspaces→panes→tabs sidebar), ~~detach/reattach~~ (shipped as
+  a dtach-style daemon: `src/attach/` owns a PTY running the TUI; `gt`
+  proxies raw bytes over `<session>.attach.sock`, replays DECSET modes and
+  forces a full repaint via the `redraw` control method on reattach; TUI
+  exit 42 = dev reload respawn).
+- ~~Interactive pane resize~~ (shipped: `prefix r` resize mode with h/j/k/l,
+  plus mouse-draggable gutters between panes — pane_gap cells wide).
+- ~~Theming~~ (shipped: `[appearance] theme` with ghosttown/catppuccin
+  (mocha+latte)/tokyonight/gruvbox/nord/dracula palettes in `src/ui/themes.ts`,
+  `[theme]` per-color overrides).
+- ~~Profile switching~~ (shipped: `prefix s` / `prefix S` — the daemon sends
+  `bye reason:"switch"` and the attach client re-enters its connect loop
+  against the target session, spawning that daemon if needed; the old
+  session keeps running detached).
+- ~~Session snapshots~~ (shipped: `src/core/persist.ts` writes the layout —
+  workspaces, split ratios, panes, tab order, per-surface cwd — to
+  `$XDG_STATE_HOME/ghosttown/<session>.session.json` on structural changes
+  and every 30s; `initSession` rebuilds from it, so reload, a TUI crash and a
+  reboot all come back. Processes are not restored: a restored surface is a
+  fresh shell in its old directory. An explicit quit/kill drops the snapshot).
+- **Phase 2 — remaining persistence:** scrollback view + search,
+  worktree-per-agent helper (`gt new --worktree`).
+- **Phase 2.5 — the real fix for reload:** move the surface PTYs into the
+  daemon so it owns the model and the TUI is only a view. Reload then keeps
+  the processes themselves (today it only rebuilds the layout around new
+  shells), and a TUI crash costs nothing. Needs: a surface manager + headless
+  `PersistentTerminal` per surface in the daemon (the query responder needs a
+  cursor, see `runtime.ts`), surface I/O frames on the attach socket, and a
+  bounded raw-output ring buffer replayed into the fresh renderable —
+  ghostty exposes no screen serializer, only `getText`/`getJson`.
 - **Phase 3 — the flexes:** kitty keyboard passthrough (per-child re-encoding),
-  DECRQM/mode mirroring per pane, workspaces (multiple layouts), remote attach
-  over SSH, `bun build --compile` single-binary releases.
+  DECRQM/mode mirroring per pane, remote attach over SSH,
+  `bun build --compile` single-binary releases.
 
 ## Reference material
 

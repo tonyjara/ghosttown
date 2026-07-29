@@ -9,6 +9,12 @@ The mental model: **a pane is an agent's slot.** The agent CLI, a shell in the
 same directory, the dev server — they're tabs behind one pane. Your screen
 layout maps to "which agents am I running", not "which windows are open".
 
+The hierarchy: **profile → workspaces → panes → tabs.** A profile (the
+session) holds any number of workspaces; each workspace is its own pane
+layout, switched instantly with everything kept alive. The left sidebar shows
+the profile's workspaces on top and every active agent below (most recently
+done first).
+
 ```
 ┌ 1:claude ✳  2:zsh  + ──────────┬ 1:claude ⚑ ●  2:lazygit  + ────┐
 │                                │                                │
@@ -24,10 +30,15 @@ layout maps to "which agents am I running", not "which windows are open".
 
 ```sh
 bun install
-bun run start                 # start the mux (session "main")
+bun run start                 # start the mux (session "main"), or reattach
 bun start -- --session work  # a second session
 bun link                      # optional: global `gt` command
 ```
+
+Sessions run in a background daemon: plain `gt` starts one, `prefix d`
+detaches (everything keeps running), running `gt` again reattaches with the
+screen intact. `GHOSTTOWN_NO_DAEMON=1` runs the TUI directly in the terminal
+(no detach) for debugging.
 
 Requires Bun ≥ 1.2 on macOS or Linux. All native pieces (PTY, terminal
 emulation, renderer) ship prebuilt — no toolchain needed.
@@ -39,15 +50,60 @@ emulation, renderer) ship prebuilt — no toolchain needed.
 | `\|` or `\` | split right |
 | `-` | split down |
 | `h j k l` / arrows | focus pane by direction |
-| `c` | new tab in the focused pane |
+| `r` | **resize mode** — `h j k l`/arrows move the divider, `esc` leaves |
+| `T` (shift+t) | new tab in the focused pane |
 | `n` / `p` | next / previous tab |
 | `1`–`9` | select tab N |
-| `x` | close tab (pane closes with its last tab) |
-| `q` | quit |
+| `D` (shift+d) | close tab — with its last tab, the pane closes too |
+| `C` (shift+c) | **new workspace** (its terminal takes focus) |
+| `X` (shift+x) | **delete workspace** (confirm dialog) |
+| `b` | toggle the sidebar |
+| `s` | **switch profile** — pick another running session |
+| `S` (shift+s) | **new profile** — name a fresh session and jump there |
+| `d` | detach — the session keeps running in the background |
+| `R` (shift+r) | reload the TUI from source (dev loop; layout restored, shells restart) |
+| `Q` (shift+q) | kill ghosttown and everything inside it |
 | `?` | floating help pane with the effective keybinds |
 | `Ctrl+A` again | send a literal Ctrl+A |
 
-Mouse: click a pane to focus it, click a tab to select it.
+Mouse: click a pane to focus it, click a tab to select it, click a sidebar
+row to move focus into the sidebar on that row (opening the workspace /
+revealing the agent), **drag the gap between panes to resize them**.
+
+Profiles are sessions: switching jumps this terminal to another session's
+daemon (starting it if needed) while the current one keeps running detached —
+`gt --session <name>` reattaches to any of them later.
+
+### Session snapshots
+
+Detaching keeps everything alive — the session is still running, you just
+stopped looking at it. Reload, a crash, or a reboot are different: the TUI
+process owns every surface PTY, so they go down with it.
+
+For those, ghosttown keeps a snapshot of the *structure* in
+`~/.local/state/ghosttown/<session>.session.json`, written whenever the
+layout changes and every 30s after that. On the next start it rebuilds
+workspaces, split ratios, panes, tab order, and drops each surface back in the
+directory it was in. Programs are **not** restarted — a restored surface is a
+fresh shell, so a `claude` tab comes back as a prompt in the right repo.
+
+`prefix Q` (and `gt kill`) deletes the snapshot: quitting is a decision, so
+the next start is clean. Turn the whole thing off with `restore_session =
+false` under `[general]`.
+
+### Sidebar
+
+`prefix h` from the leftmost pane moves focus into the sidebar (it behaves
+like a pane), and so does clicking it; `prefix l` or `esc` returns to the
+panes. While the sidebar is focused, keys are direct — no prefix:
+
+| Key | Action |
+|---|---|
+| `j` / `k` | move down / up (flows between the two halves) |
+| `enter` | open the workspace / jump to the agent |
+| `a` | new workspace (focus follows into its terminal) |
+| `r` | rename workspace |
+| `d` | delete workspace (confirm dialog) / kill the agent |
 
 ## Configuration
 
@@ -66,6 +122,15 @@ is respected.
 
 ```toml
 # ~/.config/ghosttown/config.toml
+[appearance]
+theme = "catppuccin-mocha"   # or: ghosttown, catppuccin-latte, tokyonight,
+                             #     gruvbox, nord, dracula
+pane_gap = 1                 # cells between panes (they double as drag handles)
+cursor_blink = true
+
+[theme]                      # optional per-color overrides on the theme
+accent = "#f5c2e7"
+
 [keybinds]
 prefix = "ctrl+g"
 "new-tab" = ["t"]     # replaces the default list for that action
@@ -76,6 +141,13 @@ sound = "Ping"
 
 `prefix ?` shows the *merged* keybinds, so the help pane always matches
 what your keys actually do.
+
+### Sidebar agents
+
+Any surface that ever worked (or ever reported via `gt report`) stays in the
+sidebar's agents list — `✳ running`, `⚑ blocked`, `✓ done`, and `○ idle`
+between runs — most recently active first, so finished agents remain one
+`enter` away.
 
 ## Agent status
 

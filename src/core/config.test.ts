@@ -3,12 +3,15 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ACTIONS,
   deepMerge,
   helpRows,
   keysForAction,
   loadConfig,
+  normalizeKeySpec,
   parseChord,
   setConfigForTest,
+  type Action,
 } from "./config";
 
 afterEach(() => {
@@ -21,6 +24,27 @@ describe("parseChord", () => {
     expect(parseChord("ctrl+a")).toEqual({ ctrl: true, alt: false, shift: false, name: "a" });
     expect(parseChord("alt+shift+x")).toEqual({ ctrl: false, alt: true, shift: true, name: "x" });
     expect(parseChord("ctrl+space")).toEqual({ ctrl: true, alt: false, shift: false, name: " " });
+  });
+});
+
+describe("normalizeKeySpec", () => {
+  it("folds shift into the character the terminal actually sends", () => {
+    expect(normalizeKeySpec("shift+c")).toBe("C");
+    expect(normalizeKeySpec("shift+t")).toBe("T");
+    expect(normalizeKeySpec("C")).toBe("C");
+  });
+
+  it("leaves bare keys alone", () => {
+    expect(normalizeKeySpec("c")).toBe("c");
+    expect(normalizeKeySpec("|")).toBe("|");
+    expect(normalizeKeySpec("+")).toBe("+");
+    expect(normalizeKeySpec("left")).toBe("left");
+    expect(normalizeKeySpec("space")).toBe(" ");
+  });
+
+  it("keeps other modifiers in the chord", () => {
+    expect(normalizeKeySpec("ctrl+x")).toBe("ctrl+x");
+    expect(normalizeKeySpec("alt+shift+enter")).toBe("alt+shift+enter");
   });
 });
 
@@ -39,6 +63,31 @@ describe("loadConfig", () => {
     expect(config.keybinds.prefix).toBe("ctrl+a");
     expect(keysForAction(config, "split-right")).toContain("|");
     expect(config.notifications.enabled).toBe(true);
+    expect(config.sidebar.visible).toBe(true);
+    expect(config.sidebar.width).toBe(28);
+    expect(keysForAction(config, "toggle-sidebar")).toEqual(["b"]);
+    // Tabs and workspaces are shifted so they need intent, and no shifted
+    // binding may collide with the unshifted key of another action.
+    expect(keysForAction(config, "new-tab")).toEqual(["T"]);
+    expect(keysForAction(config, "close-tab")).toEqual(["D"]);
+    expect(keysForAction(config, "new-workspace")).toEqual(["C"]);
+    expect(keysForAction(config, "delete-workspace")).toEqual(["X"]);
+    expect(keysForAction(config, "detach")).toEqual(["d"]);
+    expect(keysForAction(config, "reload")).toEqual(["R"]);
+    expect(keysForAction(config, "quit")).toEqual(["Q"]);
+  });
+
+  it("no two actions claim the same key", () => {
+    process.env.GHOSTTOWN_CONFIG = "/nonexistent/nope.toml";
+    const config = loadConfig();
+    const owner = new Map<string, Action>();
+    for (const action of ACTIONS) {
+      for (const spec of keysForAction(config, action)) {
+        const key = normalizeKeySpec(spec);
+        expect(owner.get(key) ?? action).toBe(action);
+        owner.set(key, action);
+      }
+    }
   });
 
   it("user config overrides defaults, rest falls through", () => {

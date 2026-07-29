@@ -5,7 +5,7 @@
 import { render, useRenderer } from "@opentui/solid";
 import type { CliRenderer } from "@opentui/core";
 import { unlinkSync } from "node:fs";
-import { initSession } from "./core/state";
+import { initSession, quit, setRedrawHandler } from "./core/state";
 import { startControlServer, prepareSocketPath } from "./control/server";
 import { App } from "./ui/App";
 
@@ -53,6 +53,18 @@ function shutdown(code: number): never {
 
 function Root() {
   renderer = useRenderer();
+  setRedrawHandler(() => {
+    // Private flag (pinned @opentui/core 0.4.5): the diff renderer's only
+    // full-frame switch. Needed when a detached client reattaches to a
+    // blank terminal that the diff thinks is already painted.
+    const r = renderer as unknown as {
+      forceFullRepaintRequested?: boolean;
+      requestRender?: () => void;
+    } | null;
+    if (!r) return;
+    r.forceFullRepaintRequested = true;
+    r.requestRender?.();
+  });
   return <App />;
 }
 
@@ -72,13 +84,15 @@ export async function startApp(opts: {
   initSession({
     session: opts.session,
     socketPath,
-    quit: () => shutdown(0),
+    quit: (code) => shutdown(code),
     command: opts.command,
     args: opts.args,
   });
   startControlServer(socketPath);
 
-  process.on("SIGTERM", () => shutdown(0));
+  // The daemon SIGTERMs us when the session is killed — same deal as
+  // prefix+Q, so tear down properly (surfaces, snapshot) instead of vanishing.
+  process.on("SIGTERM", () => quit());
 
   await render(() => <Root />, {
     exitOnCtrlC: false,

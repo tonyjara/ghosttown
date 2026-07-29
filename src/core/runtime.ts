@@ -4,10 +4,21 @@
  * Reactive metadata lives in the store; this registry holds live handles.
  */
 import { spawn, type IPty } from "bun-pty";
-import type { GhosttyTerminalRenderable } from "ghostty-opentui/opentui";
+import type { MouseModes } from "./mouse";
 import { OutputScanner } from "./queries";
 import { StatusTracker } from "./status";
 import type { AgentStatus } from "./types";
+
+/**
+ * The slice of a surface's terminal renderable a runtime drives — keeps core
+ * off the renderer. src/ui/MuxTerminal implements it.
+ */
+export interface SurfaceView {
+  feed(data: string): void;
+  getCursor(): [number, number];
+  getText(): string;
+  snapToLive(): void;
+}
 
 export interface SurfaceCallbacks {
   onTitle: (title: string) => void;
@@ -29,7 +40,7 @@ export class SurfaceRuntime {
   readonly pty: IPty;
   readonly tracker: StatusTracker;
   private scanner: OutputScanner;
-  private renderable: GhosttyTerminalRenderable | null = null;
+  private renderable: SurfaceView | null = null;
   private pending: string[] = [];
   private disposed = false;
 
@@ -65,7 +76,7 @@ export class SurfaceRuntime {
     });
   }
 
-  attachRenderable(r: GhosttyTerminalRenderable): void {
+  attachRenderable(r: SurfaceView): void {
     this.renderable = r;
     if (this.pending.length > 0) {
       for (const chunk of this.pending) r.feed(chunk);
@@ -80,13 +91,39 @@ export class SurfaceRuntime {
   write(data: string): void {
     if (this.disposed) return;
     this.tracker.recordInput();
+    // Typing while scrolled back would send keys to a screen you cannot see.
+    this.renderable?.snapToLive();
     this.pty.write(data);
   }
 
+  /** Mouse reporting this surface's program has asked for. */
+  mouseModes(): MouseModes {
+    return this.scanner.mouseModes();
+  }
+
+  /**
+   * Hand an encoded mouse event to the program. Deliberately not recorded as
+   * input: ?1003 reports every motion, which would keep resetting the status
+   * heuristic while the pointer merely crosses the pane.
+   */
+  reportMouse(data: string): void {
+    if (this.disposed) return;
+    this.pty.write(data);
+  }
+
+  private lastCols = 0;
+  private lastRows = 0;
+
   resize(cols: number, rows: number): void {
     if (this.disposed) return;
+    const c = Math.max(2, cols);
+    const r = Math.max(1, rows);
+    // syncSizes runs on every divider drag step — skip no-op resizes.
+    if (c === this.lastCols && r === this.lastRows) return;
+    this.lastCols = c;
+    this.lastRows = r;
     try {
-      this.pty.resize(Math.max(2, cols), Math.max(1, rows));
+      this.pty.resize(c, r);
     } catch {
       // PTY may have exited under us.
     }

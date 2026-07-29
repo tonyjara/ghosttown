@@ -34,7 +34,12 @@ export interface SurfaceMeta {
   unread: boolean;
   /** True once the surface has ever received an explicit `gt report`. */
   hasReporter: boolean;
+  /** True once the surface has ever been non-idle — it stays in the agents
+   * list forever after, shown as idle between runs. */
+  everActive: boolean;
   exited: boolean;
+  /** Last status change away from idle (drives agent list ordering). */
+  lastActiveAt?: number;
 }
 
 export interface PaneState {
@@ -43,17 +48,33 @@ export interface PaneState {
   activeIdx: number;
 }
 
+/** A workspace: one split-tree of panes. The profile is a list of these. */
+export interface WorkspaceState {
+  id: string;
+  name: string;
+  layout: LayoutNode | null;
+  focusedPaneId: string;
+}
+
+export interface PaneSnapshot {
+  id: string;
+  rect: Rect;
+  focused: boolean;
+  surfaces: Array<
+    Pick<SurfaceMeta, "id" | "title" | "command" | "status" | "unread"> & {
+      active: boolean;
+    }
+  >;
+}
+
+export interface WorkspaceSnapshot {
+  id: string;
+  name: string;
+  active: boolean;
+  panes: PaneSnapshot[];
+}
+
 export interface SessionSnapshot {
   session: string;
-  focusedPaneId: string;
-  panes: Array<{
-    id: string;
-    rect: Rect;
-    focused: boolean;
-    surfaces: Array<
-      Pick<SurfaceMeta, "id" | "title" | "command" | "status" | "unread"> & {
-        active: boolean;
-      }
-    >;
-  }>;
+  workspaces: WorkspaceSnapshot[];
 }

@@ -1,6 +1,6 @@
 import { Show, createMemo } from "solid-js";
 import { loadConfig } from "../core/config";
-import { store } from "../core/state";
+import { activeWorkspace, focusedPaneId, store } from "../core/state";
 import { theme } from "./theme";
 
 function prefixHint(): string {
@@ -24,7 +24,7 @@ export function StatusBar() {
   });
 
   const focusedTitle = createMemo(() => {
-    const pane = store.panes[store.focusedPaneId];
+    const pane = store.panes[focusedPaneId()];
     const sid = pane?.surfaceIds[pane.activeIdx];
     return sid ? (store.surfaces[sid]?.title ?? "") : "";
   });
@@ -33,13 +33,18 @@ export function StatusBar() {
     <box
       position="absolute"
       left={0}
-      top={store.area.height}
-      width={store.area.width}
+      top={store.screen.height - 1}
+      width={store.screen.width}
       height={1}
       flexDirection="row"
       backgroundColor={theme.statusBarBg}
     >
       <text content={` ⌂ ${store.session} `} fg={theme.accent} bg={theme.statusBarBg} />
+      <text
+        content={` ▣ ${activeWorkspace()?.name ?? ""} `}
+        fg={theme.statusBarFg}
+        bg={theme.statusBarBg}
+      />
       <Show when={counts().working > 0}>
         <text content={` ✳ ${counts().working} `} fg={theme.working} bg={theme.statusBarBg} />
       </Show>
@@ -52,6 +57,12 @@ export function StatusBar() {
       <box flexGrow={1} backgroundColor={theme.statusBarBg} />
       <Show when={store.prefixArmed}>
         <text content=" PREFIX " fg={theme.prefixFg} bg={theme.prefixBg} />
+      </Show>
+      <Show when={store.resizeMode}>
+        <text content=" RESIZE h j k l · esc " fg={theme.prefixFg} bg={theme.done} />
+      </Show>
+      <Show when={store.sidebar.focused}>
+        <text content=" SIDEBAR " fg={theme.prefixFg} bg={theme.accent} />
       </Show>
       <text content={` ${focusedTitle()} `} fg={theme.statusBarFg} bg={theme.statusBarBg} />
       <text content={` ${prefixHint()} ? `} fg={theme.idle} bg={theme.statusBarBg} />

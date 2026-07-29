@@ -6,6 +6,8 @@ import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { dbg } from "../core/debug";
 import {
   closeSurface,
+  focusedPaneId,
+  forceRedraw,
   newTab,
   registry,
   reportStatus,
@@ -16,18 +18,19 @@ import {
 } from "../core/state";
 import { desktopNotify } from "../core/notify";
 import { AGENT_STATUSES, socketPathFor, defaultSocketDir, type Request, type Response } from "./protocol";
+import { SocketWriter } from "./sockbuf";
 import type { AgentStatus } from "../core/types";
 
 function resolvePaneId(pane?: unknown): string {
   if (typeof pane === "string" && store.panes[pane]) return pane;
-  return store.focusedPaneId;
+  return focusedPaneId();
 }
 
 function resolveSurfaceId(surface?: unknown): string | null {
   if (typeof surface === "string") {
     return store.surfaces[surface] ? surface : null;
   }
-  const pane = store.panes[store.focusedPaneId];
+  const pane = store.panes[focusedPaneId()];
   return pane?.surfaceIds[pane.activeIdx] ?? null;
 }
 
@@ -89,6 +92,9 @@ function dispatch(method: string, params: Record<string, unknown>): unknown {
       if (!reportStatus(sid, status)) throw new Error("report failed");
       return true;
     }
+    case "redraw":
+      forceRedraw();
+      return true;
     case "notify": {
       const body = typeof params.body === "string" ? params.body : "";
       const title = typeof params.title === "string" ? params.title : "ghosttown";
@@ -140,14 +146,14 @@ export async function prepareSocketPath(session: string): Promise<string> {
 
 export function startControlServer(socketPath: string): void {
   dbg("control server listening", socketPath);
-  Bun.listen<string>({
+  Bun.listen<{ inbuf: string; out: SocketWriter }>({
     unix: socketPath,
     socket: {
       data(socket, data) {
         dbg("server data", data.toString().slice(0, 200));
-        const buffered = ((socket.data as string | undefined) ?? "") + data.toString();
+        const buffered = socket.data.inbuf + data.toString();
         const lines = buffered.split("\n");
-        socket.data = lines.pop() ?? "";
+        socket.data.inbuf = lines.pop() ?? "";
         for (const line of lines) {
           if (!line.trim()) continue;
           let response: Response;
@@ -160,16 +166,14 @@ export function startControlServer(socketPath: string): void {
           } catch (err) {
             response = { id, ok: false, error: err instanceof Error ? err.message : String(err) };
           }
-          try {
-            const written = socket.write(JSON.stringify(response) + "\n");
-            dbg("server wrote", written);
-          } catch (err) {
-            dbg("server write failed", err as Error);
-          }
+          socket.data.out.write(JSON.stringify(response) + "\n");
         }
       },
       open(socket) {
-        socket.data = "";
+        socket.data = { inbuf: "", out: new SocketWriter(socket) };
+      },
+      drain(socket) {
+        socket.data.out.flush();
       },
       error() {},
       close() {},

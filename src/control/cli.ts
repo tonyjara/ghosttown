@@ -13,7 +13,8 @@ import type { SessionSnapshot } from "../core/types";
 const HELP = `ghosttown — agent-first terminal multiplexer
 
 usage:
-  gt [--session <name>] [-- <command> [args...]]   start the mux
+  gt [--session <name>] [-- <command> [args...]]   start the mux, or reattach
+                                                   to a detached session
   gt <subcommand> [options]
 
 subcommands (run from inside a session, or with GHOSTTOWN_SOCKET set):
@@ -87,13 +88,16 @@ function surfaceParam(flags: Record<string, string | boolean>): string | undefin
 
 function formatList(snap: SessionSnapshot): string {
   const lines: string[] = [`session ${snap.session}`];
-  for (const pane of snap.panes) {
-    lines.push(
-      `  pane ${pane.id}${pane.focused ? " (focused)" : ""}  [${pane.rect.width}x${pane.rect.height} @ ${pane.rect.x},${pane.rect.y}]`,
-    );
-    for (const s of pane.surfaces) {
-      const marks = [s.active ? "*" : " ", s.unread ? "●" : " "].join("");
-      lines.push(`    ${marks} ${s.id}  ${s.status.padEnd(7)}  ${s.title}`);
+  for (const ws of snap.workspaces) {
+    lines.push(`  workspace ${ws.id} "${ws.name}"${ws.active ? " (active)" : ""}`);
+    for (const pane of ws.panes) {
+      lines.push(
+        `    pane ${pane.id}${pane.focused ? " (focused)" : ""}  [${pane.rect.width}x${pane.rect.height} @ ${pane.rect.x},${pane.rect.y}]`,
+      );
+      for (const s of pane.surfaces) {
+        const marks = [s.active ? "*" : " ", s.unread ? "●" : " "].join("");
+        lines.push(`      ${marks} ${s.id}  ${s.status.padEnd(7)}  ${s.title}`);
+      }
     }
   }
   return lines.join("\n");

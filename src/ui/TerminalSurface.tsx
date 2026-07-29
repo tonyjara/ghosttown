@@ -1,14 +1,15 @@
 import { createEffect, onCleanup, onMount } from "solid-js";
 import { useRenderer } from "@opentui/solid";
 import type { BoxRenderable, RenderContext } from "@opentui/core";
-import { GhosttyTerminalRenderable } from "ghostty-opentui/opentui";
+import { MOUSE_MODES_OFF } from "../core/mouse";
 import { registry } from "../core/state";
+import { MuxTerminal } from "./MuxTerminal";
 
 /**
- * Mounts a persistent GhosttyTerminalRenderable imperatively. The Solid JSX
- * path constructs elements with no options and sprays props through setters,
- * but `persistent` is constructor-only — so the renderable is created by
- * hand and added to a container box.
+ * Mounts a persistent MuxTerminal imperatively. The Solid JSX path constructs
+ * elements with no options and sprays props through setters, but `persistent`
+ * is constructor-only — so the renderable is created by hand and added to a
+ * container box.
  */
 export function TerminalSurface(props: {
   sid: string;
@@ -19,10 +20,10 @@ export function TerminalSurface(props: {
 }) {
   const renderer = useRenderer();
   let container: BoxRenderable | undefined;
-  let term: GhosttyTerminalRenderable | undefined;
+  let term: MuxTerminal | undefined;
 
   onMount(() => {
-    term = new GhosttyTerminalRenderable(renderer as unknown as RenderContext, {
+    term = new MuxTerminal(renderer as unknown as RenderContext, {
       id: `term-${props.sid}`,
       persistent: true,
       cols: props.cols,
@@ -33,7 +34,14 @@ export function TerminalSurface(props: {
       height: "100%",
     });
     container!.add(term);
-    registry.get(props.sid)?.attachRenderable(term);
+    const rt = registry.get(props.sid);
+    rt?.attachRenderable(term);
+    // Apps that ask for the mouse (?1000/?1002/?1003) get the events instead
+    // of the pane acting on them — that is how scrolling works in claude.
+    term.attachMouse({
+      modes: () => rt?.mouseModes() ?? MOUSE_MODES_OFF,
+      report: (data) => rt?.reportMouse(data),
+    });
   });
 
   createEffect(() => {
@@ -50,7 +58,9 @@ export function TerminalSurface(props: {
   });
   createEffect(() => {
     const s = props.showCursor;
-    if (term) term.showCursor = s;
+    if (!term) return;
+    term.showCursor = s;
+    if (!s) term.releaseCursor();
   });
 
   onCleanup(() => {

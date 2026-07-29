@@ -1,38 +1,67 @@
-import { For, Show, createEffect, createMemo } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import { useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent } from "@opentui/core";
 import {
   ACTIONS,
   keysForAction,
   loadConfig,
+  normalizeKeySpec,
   parseChord,
   type Action,
 } from "../core/config";
+import type { Gutter } from "../core/layout";
 import {
+  activeGutters,
+  allRects,
+  blurSidebar,
   closeActiveTab,
-  currentRects,
+  createWorkspace,
   cycleTab,
+  deleteWorkspace,
+  dialogBackspace,
+  dialogCancel,
+  detachClients,
+  dialogChar,
+  dialogConfirm,
+  dialogMove,
+  dragDivider,
   focusDirection,
+  focusedPaneId,
   newTab,
+  openNewProfile,
+  openSwitchProfile,
   quit,
+  reloadApp,
+  resizeFocused,
   selectTab,
   setArea,
   setHelpVisible,
   setPrefixArmed,
+  setResizeMode,
+  sidebarCreate,
+  sidebarDelete,
+  sidebarEnter,
+  sidebarMove,
+  sidebarRename,
+  setStore,
   splitPane,
   store,
+  toggleSidebar,
+  workspaceOf,
   writeToFocused,
 } from "../core/state";
 import { dbg } from "../core/debug";
+import { DialogOverlay } from "./Dialogs";
 import { HelpOverlay } from "./HelpOverlay";
 import { PaneView } from "./PaneView";
+import { Sidebar } from "./Sidebar";
 import { StatusBar } from "./StatusBar";
 import { theme } from "./theme";
 
 const PREFIX_TIMEOUT_MS = 3000;
 
 function runAction(action: Action): void {
-  const focused = store.focusedPaneId;
+  const focused = focusedPaneId();
   switch (action) {
     case "split-right":
       splitPane(focused, "row");
@@ -64,6 +93,34 @@ function runAction(action: Action): void {
     case "focus-down":
       focusDirection("down");
       return;
+    case "toggle-sidebar":
+      toggleSidebar();
+      return;
+    case "resize-mode":
+      setResizeMode(true);
+      return;
+    case "switch-profile":
+      openSwitchProfile();
+      return;
+    case "new-profile":
+      openNewProfile();
+      return;
+    case "new-workspace":
+      createWorkspace();
+      return;
+    case "delete-workspace": {
+      const activeWs = store.workspaces[store.activeWorkspaceId];
+      if (activeWs) {
+        setStore("dialog", { kind: "confirm-delete-workspace", workspaceId: activeWs.id });
+      }
+      return;
+    }
+    case "detach":
+      detachClients();
+      return;
+    case "reload":
+      reloadApp();
+      return;
     case "quit":
       quit();
       return;
@@ -73,16 +130,118 @@ function runAction(action: Action): void {
   }
 }
 
+const isEnter = (key: KeyEvent) =>
+  key.name === "return" || key.name === "enter" || key.sequence === "\r";
+
+function handleDialogKey(key: KeyEvent): void {
+  const dialog = store.dialog;
+  if (!dialog) return;
+  if (key.name === "escape") {
+    dialogCancel();
+    return;
+  }
+  if (isEnter(key)) {
+    dialogConfirm();
+    return;
+  }
+  if (dialog.kind === "confirm-delete-workspace") {
+    if (key.name === "y") dialogConfirm();
+    else if (key.name === "n" || key.name === "q") dialogCancel();
+    return;
+  }
+  if (dialog.kind === "switch-profile") {
+    if (key.name === "j" || key.name === "down") dialogMove(1);
+    else if (key.name === "k" || key.name === "up") dialogMove(-1);
+    return;
+  }
+  // Text dialogs (rename-workspace, new-profile): plain editing.
+  if (key.name === "backspace" || key.sequence === "\x7f") {
+    dialogBackspace();
+    return;
+  }
+  const ch = key.sequence ?? "";
+  if (ch.length === 1 && ch >= " " && ch !== "\x7f" && !key.ctrl && !key.meta) {
+    dialogChar(ch);
+  }
+}
+
+/** Keys while resize mode is active: h/j/k/l move dividers, esc/enter leave. */
+function handleResizeModeKey(key: KeyEvent): void {
+  switch (key.name) {
+    case "h":
+    case "left":
+      resizeFocused("left");
+      return;
+    case "l":
+    case "right":
+      resizeFocused("right");
+      return;
+    case "j":
+    case "down":
+      resizeFocused("down");
+      return;
+    case "k":
+    case "up":
+      resizeFocused("up");
+      return;
+    case "escape":
+    case "q":
+      setResizeMode(false);
+      return;
+  }
+  if (isEnter(key)) setResizeMode(false);
+  // Everything else is swallowed — it's a mode.
+}
+
+/** Direct (un-prefixed) keys while the sidebar has focus. */
+function handleSidebarKey(key: KeyEvent): void {
+  switch (key.name) {
+    case "j":
+    case "down":
+      sidebarMove(1);
+      return;
+    case "k":
+    case "up":
+      sidebarMove(-1);
+      return;
+    case "a":
+      sidebarCreate();
+      return;
+    case "r":
+      sidebarRename();
+      return;
+    case "d":
+      sidebarDelete();
+      return;
+    case "escape":
+      blurSidebar();
+      return;
+  }
+  if (isEnter(key)) sidebarEnter();
+}
+
 export function App() {
   const config = loadConfig();
   const prefixChord = parseChord(config.keybinds.prefix);
-  // key string ("h", "left", "|") → action, from the merged config.
+  // key string ("h", "left", "|", "C") → action, from the merged config.
   const actionByKey = new Map<string, Action>();
   for (const action of ACTIONS) {
     for (const key of keysForAction(config, action)) {
-      actionByKey.set(key, action);
+      actionByKey.set(normalizeKeySpec(key), action);
     }
   }
+
+  /**
+   * A shifted letter arrives as name "c" + shift, sequence "C". Match the
+   * uppercase form *only* — falling back to the lowercase name would make
+   * prefix+shift+C run whatever "c" is bound to.
+   */
+  const actionFor = (key: KeyEvent): Action | undefined => {
+    if (key.shift && key.name?.length === 1) {
+      return actionByKey.get(key.name.toUpperCase());
+    }
+    return actionByKey.get(key.sequence || key.name) ?? actionByKey.get(key.name);
+  };
 
   const dims = useTerminalDimensions();
   createEffect(() => {
@@ -110,6 +269,12 @@ export function App() {
   useKeyboard((key: KeyEvent) => {
     if (key.eventType === "release") return;
 
+    // Dialogs are modal above everything.
+    if (store.dialog) {
+      handleDialogKey(key);
+      return;
+    }
+
     // Help overlay is modal: nothing reaches the pty while it's open.
     if (store.helpVisible) {
       if (isPrefix(key)) {
@@ -118,7 +283,7 @@ export function App() {
       }
       if (store.prefixArmed) {
         disarm();
-        if (actionByKey.get(key.sequence || key.name) === "help") {
+        if (actionFor(key) === "help") {
           setHelpVisible(false);
           return;
         }
@@ -129,9 +294,24 @@ export function App() {
       return;
     }
 
+    // Resize mode: modal over the ptys, but the prefix still works.
+    if (store.resizeMode) {
+      if (isPrefix(key)) {
+        setResizeMode(false);
+        arm();
+        return;
+      }
+      handleResizeModeKey(key);
+      return;
+    }
+
     if (!store.prefixArmed) {
       if (isPrefix(key)) {
         arm();
+        return;
+      }
+      if (store.sidebar.visible && store.sidebar.focused) {
+        handleSidebarKey(key);
         return;
       }
       const bytes = key.raw || key.sequence;
@@ -143,52 +323,113 @@ export function App() {
     dbg("prefix cmd", { name: key.name, seq: key.sequence, ctrl: key.ctrl });
 
     if (isPrefix(key)) {
-      // Prefix twice → send it literally.
-      writeToFocused(key.raw || key.sequence || "");
+      // Prefix twice → send it literally (unless the sidebar eats keys).
+      if (!store.sidebar.focused) writeToFocused(key.raw || key.sequence || "");
       return;
     }
-    const action = actionByKey.get(key.sequence || key.name) ?? actionByKey.get(key.name);
+    const action = actionFor(key);
     if (action) {
       runAction(action);
       return;
     }
     if (/^[1-9]$/.test(key.name)) {
-      selectTab(store.focusedPaneId, Number(key.name) - 1);
+      selectTab(focusedPaneId(), Number(key.name) - 1);
     }
   });
 
   usePaste((event) => {
     const text: string = (event as unknown as { text: string }).text ?? "";
-    if (text) writeToFocused(`\x1b[200~${text}\x1b[201~`);
+    if (text && !store.dialog && !store.sidebar.focused && !store.resizeMode) {
+      writeToFocused(`\x1b[200~${text}\x1b[201~`);
+    }
   });
 
   const rects = createMemo(() => {
-    // Track layout + area so the memo recomputes on any structural change.
-    void store.layout;
-    void store.area.width;
-    void store.area.height;
-    return currentRects();
+    // Track screen, sidebar, and every workspace layout for structural changes.
+    void store.screen.width;
+    void store.screen.height;
+    void store.sidebar.visible;
+    for (const wsId of store.workspaceOrder) void store.workspaces[wsId]?.layout;
+    return allRects();
+  });
+
+  // Divider drag: mousedown on a gutter starts a session; the ROOT box sees
+  // every drag/up event via bubbling (capture may land on whatever renderable
+  // the pointer is over, but propagation always reaches the root).
+  const [draggingGutter, setDraggingGutter] = createSignal<Gutter | null>(null);
+  const [hoveredGutter, setHoveredGutter] = createSignal<string | null>(null);
+  const gutters = createMemo(() => {
+    void store.screen.width;
+    void store.screen.height;
+    void store.sidebar.visible;
+    void store.workspaces[store.activeWorkspaceId]?.layout;
+    return activeGutters().filter((g) => g.rect.width > 0 && g.rect.height > 0);
   });
 
   return (
-    <box width="100%" height="100%" backgroundColor={theme.bg}>
+    <box
+      width="100%"
+      height="100%"
+      backgroundColor={theme.bg}
+      onMouseDrag={(e: { x: number; y: number }) => {
+        const g = draggingGutter();
+        if (g) dragDivider(g, g.dir === "row" ? e.x : e.y);
+      }}
+      onMouseUp={() => setDraggingGutter(null)}
+      onMouseDragEnd={() => setDraggingGutter(null)}
+    >
       <For each={Object.keys(store.panes)}>
         {(paneId) => {
           const rect = () => rects().get(paneId);
+          const inActiveWorkspace = createMemo(
+            () => workspaceOf(paneId) === store.activeWorkspaceId,
+          );
           return (
             <Show when={rect() && store.panes[paneId]}>
               <PaneView
                 pane={store.panes[paneId]!}
                 rect={rect()!}
-                focused={paneId === store.focusedPaneId}
+                visible={inActiveWorkspace()}
+                focused={
+                  inActiveWorkspace() &&
+                  paneId === focusedPaneId() &&
+                  !store.sidebar.focused
+                }
               />
             </Show>
           );
         }}
       </For>
+      <For each={gutters()}>
+        {(g) => (
+          <box
+            position="absolute"
+            left={g.rect.x}
+            top={g.rect.y}
+            width={g.rect.width}
+            height={g.rect.height}
+            backgroundColor={
+              draggingGutter()?.path === g.path
+                ? theme.accent
+                : hoveredGutter() === g.path
+                  ? theme.sidebarSelBg
+                  : theme.bg
+            }
+            onMouseDown={() => setDraggingGutter(g)}
+            onMouseOver={() => setHoveredGutter(g.path)}
+            onMouseOut={() => setHoveredGutter((h) => (h === g.path ? null : h))}
+          />
+        )}
+      </For>
+      <Show when={store.sidebar.visible}>
+        <Sidebar />
+      </Show>
       <StatusBar />
       <Show when={store.helpVisible}>
         <HelpOverlay />
+      </Show>
+      <Show when={store.dialog}>
+        <DialogOverlay />
       </Show>
     </box>
   );

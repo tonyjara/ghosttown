@@ -1,4 +1,5 @@
 import type { Request, Response } from "./protocol";
+import { SocketWriter } from "./sockbuf";
 
 let nextRequestId = 1;
 
@@ -20,11 +21,16 @@ export async function request(
       }
     }, timeoutMs);
 
+    let writer: SocketWriter | undefined;
     Bun.connect({
       unix: socketPath,
       socket: {
         open(socket) {
-          socket.write(JSON.stringify(req) + "\n");
+          writer = new SocketWriter(socket);
+          writer.write(JSON.stringify(req) + "\n");
+        },
+        drain() {
+          writer?.flush();
         },
         data(socket, data) {
           buffer += data.toString();

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { MOUSE_MODES_OFF, trackingLevel } from "./mouse";
 import { OutputScanner, trailingIncompleteEscape } from "./queries";
 
 function makeScanner(cursor: [number, number] = [4, 2]) {
@@ -63,6 +64,48 @@ describe("OutputScanner", () => {
     expect(responses).toEqual(["\x1b[1;1R"]);
     scanner.scan("more text");
     expect(responses).toEqual(["\x1b[1;1R"]);
+  });
+});
+
+describe("OutputScanner mouse modes", () => {
+  it("starts with the mouse off", () => {
+    const { scanner } = makeScanner();
+    expect(scanner.mouseModes()).toEqual(MOUSE_MODES_OFF);
+  });
+
+  it("follows what the child sets and resets", () => {
+    const { scanner } = makeScanner();
+    // What claude sends when its UI comes up.
+    scanner.scan("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+    expect(trackingLevel(scanner.mouseModes())).toBe("any");
+    expect(scanner.mouseModes().sgr).toBe(true);
+    scanner.scan("\x1b[?1003l\x1b[?1002l\x1b[?1000l");
+    expect(trackingLevel(scanner.mouseModes())).toBe("off");
+  });
+
+  it("reads several modes out of one sequence", () => {
+    const { scanner } = makeScanner();
+    scanner.scan("\x1b[?1002;1006h");
+    expect(trackingLevel(scanner.mouseModes())).toBe("drag");
+    expect(scanner.mouseModes().sgr).toBe(true);
+  });
+
+  it("picks up a mode split across chunks", () => {
+    const { scanner } = makeScanner();
+    scanner.scan("text\x1b[?100");
+    expect(trackingLevel(scanner.mouseModes())).toBe("off");
+    scanner.scan("2h");
+    expect(trackingLevel(scanner.mouseModes())).toBe("drag");
+  });
+
+  it("answers DECRQM with the mode the child actually set", () => {
+    const { scanner, responses } = makeScanner();
+    scanner.scan("\x1b[?1000h");
+    scanner.scan("\x1b[?1000$p");
+    expect(responses).toEqual(["\x1b[?1000;1$y"]);
+    responses.length = 0;
+    scanner.scan("\x1b[?1006$p");
+    expect(responses).toEqual(["\x1b[?1006;2$y"]);
   });
 });
 

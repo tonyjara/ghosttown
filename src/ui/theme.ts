@@ -1,22 +1,26 @@
+import { loadConfig, type Config } from "../core/config";
+import { dbg } from "../core/debug";
 import type { AgentStatus } from "../core/types";
+import { THEMES, type Theme } from "./themes";
 
-export const theme = {
-  bg: "#101019",
-  stripBg: "#1c1c2a",
-  stripBgFocused: "#2a2a44",
-  tabFg: "#8888a0",
-  tabFgActive: "#e8e8f0",
-  tabBgActive: "#3d3d66",
-  accent: "#7aa2f7",
-  statusBarBg: "#16161f",
-  statusBarFg: "#9999b0",
-  prefixFg: "#101019",
-  prefixBg: "#e5c07b",
-  working: "#e5c07b",
-  blocked: "#e06c75",
-  done: "#98c379",
-  idle: "#555570",
-};
+export type { Theme } from "./themes";
+
+/** Named theme from [appearance], then [theme] color overrides on top. */
+export function resolveTheme(config: Config): Theme {
+  const name = config.appearance?.theme || "ghosttown";
+  const base = THEMES[name];
+  if (!base) dbg("theme: unknown theme, using ghosttown", name);
+  const out: Theme = { ...(base ?? THEMES["ghosttown"]!) };
+  for (const [key, value] of Object.entries(config.theme ?? {})) {
+    if (key in out && typeof value === "string" && value) {
+      (out as unknown as Record<string, string>)[key] = value;
+    }
+  }
+  return out;
+}
+
+/** Resolved once at startup; prefix+R (reload) picks up config changes. */
+export const theme: Theme = resolveTheme(loadConfig());
 
 export function statusGlyph(status: AgentStatus): { glyph: string; color: string } {
   switch (status) {
@@ -29,4 +33,10 @@ export function statusGlyph(status: AgentStatus): { glyph: string; color: string
     default:
       return { glyph: "", color: theme.idle };
   }
+}
+
+/** Sidebar variant: idle agents get an explicit glyph instead of nothing. */
+export function agentGlyph(status: AgentStatus): { glyph: string; color: string } {
+  if (status === "idle") return { glyph: "○", color: theme.idle };
+  return statusGlyph(status);
 }

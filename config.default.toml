@@ -13,6 +13,31 @@
 shell = ""
 # Session name when `gt` is started without --session.
 session = "main"
+# Keep a layout snapshot (workspaces, splits, tabs, each surface's directory)
+# and rebuild from it when a session starts — after a reload, a crash, or a
+# reboot. Restored surfaces are fresh shells in their old directory; programs
+# that were running are not restarted. `prefix Q` drops the snapshot, so an
+# explicit quit always starts clean. Snapshots live in
+# $XDG_STATE_HOME/ghosttown (~/.local/state/ghosttown).
+restore_session = true
+
+[appearance]
+# Color theme. Built-in: ghosttown, catppuccin-mocha, catppuccin-latte,
+# tokyonight, gruvbox, nord, dracula.
+theme = "ghosttown"
+# Cells of spacing between panes. The gaps double as mouse drag-handles for
+# resizing. 0 = panes touch (drag-resize then needs resize mode).
+pane_gap = 1
+# Blink the cursor in the focused pane.
+cursor_blink = true
+
+# Override individual colors of the chosen theme (all keys optional):
+# [theme]
+# accent = "#ff79c6"
+# bg = "#101019"
+# Full key list: bg, stripBg, stripBgFocused, tabFg, tabFgActive, tabBgActive,
+# accent, statusBarBg, statusBarFg, prefixFg, prefixBg, working, blocked,
+# done, idle, sidebarBg, sidebarSelBg.
 
 [notifications]
 # Desktop notifications when an agent finishes or blocks in a non-visible tab.
@@ -20,23 +45,53 @@ enabled = true
 # macOS notification sound name ("" for silent). E.g. Glass, Ping, Submarine.
 sound = "Glass"
 
+[sidebar]
+# Show the sidebar (profile / workspaces / agents) on startup.
+visible = true
+# Sidebar width in columns (shrinks automatically on narrow terminals).
+width = 28
+
 [keybinds]
 # The prefix chord, tmux-style. Press it twice to send it literally.
 # Format: modifiers+key, e.g. "ctrl+a", "ctrl+space", "alt+g".
 prefix = "ctrl+a"
 
 # Everything below is pressed AFTER the prefix.
-# Each action takes a list of keys; any of them triggers it.
+# Each action takes a list of keys; any of them triggers it. An uppercase
+# letter means shift ("T" = shift+t); "shift+t" is accepted too.
 "split-right" = ["|", "\\", "%"]
 "split-down" = ["-", "\""]
-"new-tab" = ["c"]
+# Tabs live inside a pane. Closing the last tab of a pane closes the pane.
+"new-tab" = ["T"]
 "next-tab" = ["n"]
 "prev-tab" = ["p"]
-"close-tab" = ["x"]
+"close-tab" = ["D"]
 "focus-left" = ["h", "left"]
 "focus-right" = ["l", "right"]
 "focus-up" = ["k", "up"]
 "focus-down" = ["j", "down"]
-"quit" = ["q"]
+"toggle-sidebar" = ["b"]
+# Resize mode: h/j/k/l (or arrows) move the pane's divider; esc/enter leave.
+"resize-mode" = ["r"]
+# Profiles are whole sessions, each with its own background daemon.
+# switch-profile lists running profiles; new-profile asks for a name and
+# jumps there (the old profile keeps running detached).
+"switch-profile" = ["s"]
+"new-profile" = ["S"]
+# Workspaces (layouts) within a profile. Shifted to prevent accidental triggers.
+"new-workspace" = ["C"]
+"delete-workspace" = ["X"]
+# Detach: all clients drop, the session keeps running in the background.
+# Reattach with plain `gt` (or `gt --session <name>`).
+"detach" = ["d"]
+# The next two are deliberately shifted so a stray keystroke can't fire them.
+# Reload: restart the TUI from the current source (dev loop). The TUI owns the
+# surface PTYs, so they are killed and respawned with it — layout included.
+"reload" = ["R"]
+# Kill ghosttown completely: every tab, workspace, client, and the daemon.
+"quit" = ["Q"]
 "help" = ["?"]
 # Tabs 1-9 are always prefix+1 .. prefix+9.
+# While the sidebar is focused (reach it with focus-left from the leftmost
+# pane, or by clicking it), keys are direct (no prefix): j/k move, enter opens,
+# a adds a workspace, r renames, d deletes (workspaces confirm; agents die).

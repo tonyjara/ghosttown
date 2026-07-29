@@ -1,13 +1,16 @@
 /**
  * Scans child PTY output for terminal queries that need answers (the emulator
- * is render-only, so answering is on us) and for OSC sequences worth
- * observing (title changes, notifications).
+ * is render-only, so answering is on us) and for sequences worth observing:
+ * OSC (title changes, notifications) and the mouse-reporting modes that decide
+ * whether a pane forwards mouse events to its program (src/core/mouse.ts).
  *
  * The stream itself is never modified — everything is still fed to the
  * emulator. We only watch it go by. A small carry buffer handles escape
  * sequences split across chunk boundaries; the carry is always an
  * *incomplete* sequence, so nothing is ever matched (and answered) twice.
  */
+
+import { applyMouseMode, mouseModeState, MOUSE_MODES_OFF, type MouseModes } from "./mouse";
 
 const MAX_CARRY = 4096;
 
@@ -24,11 +27,19 @@ const CSI_QUERY =
   // CPR / DSR / DA1 / DA2 / kitty / DECRQM / XTVERSION
   /\x1b\[(?:(\??)6n|5n|(0?)c|>0?c|\?u|\?(\d+)\$p|>0?q)/g;
 const OSC = /\x1b\]([0-9]+);([^\x07\x1b]*)(\x07|\x1b\\)/g;
+/** DECSET/DECRST, which may carry several modes in one sequence. */
+const PRIVATE_MODE = /\x1b\[\?([\d;]+)([hl])/g;
 
 export class OutputScanner {
   private carry = "";
+  private modes: MouseModes = MOUSE_MODES_OFF;
 
   constructor(private hooks: ScannerHooks) {}
+
+  /** Mouse reporting the child has asked for, right now. */
+  mouseModes(): MouseModes {
+    return this.modes;
+  }
 
   scan(chunk: string): void {
     const text = this.carry + chunk;
@@ -43,6 +54,14 @@ export class OutputScanner {
     OSC.lastIndex = 0;
     while ((m = OSC.exec(text)) !== null) {
       this.handleOsc(m[1]!, m[2]!, m[3]!);
+    }
+
+    PRIVATE_MODE.lastIndex = 0;
+    while ((m = PRIVATE_MODE.exec(text)) !== null) {
+      const set = m[2] === "h";
+      for (const code of m[1]!.split(";")) {
+        this.modes = applyMouseMode(this.modes, code, set);
+      }
     }
 
     this.carry = trailingIncompleteEscape(text);
@@ -65,8 +84,11 @@ export class OutputScanner {
       respond("\x1b[?0u"); // kitty keyboard: no flags (graceful degrade)
     } else if (seq.endsWith("$p")) {
       const mode = m[3]!;
+      const tracked = mouseModeState(this.modes, mode);
+      // Mouse modes: report what the child actually set, since we honour them.
       // 2026 (sync updates): recognized but off. Everything else: unknown.
-      respond(mode === "2026" ? "\x1b[?2026;2$y" : `\x1b[?${mode};0$y`);
+      if (tracked !== null) respond(`\x1b[?${mode};${tracked ? 1 : 2}$y`);
+      else respond(mode === "2026" ? "\x1b[?2026;2$y" : `\x1b[?${mode};0$y`);
     } else if (seq.endsWith("q")) {
       respond("\x1bP>|ghosttown 0.1.0\x1b\\");
     }
