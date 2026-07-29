@@ -2,28 +2,88 @@ import { For, Show, createEffect, createMemo } from "solid-js";
 import { useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent } from "@opentui/core";
 import {
+  ACTIONS,
+  keysForAction,
+  loadConfig,
+  parseChord,
+  type Action,
+} from "../core/config";
+import {
   closeActiveTab,
   currentRects,
   cycleTab,
   focusDirection,
-  focusPane,
   newTab,
   quit,
   selectTab,
   setArea,
+  setHelpVisible,
   setPrefixArmed,
   splitPane,
   store,
   writeToFocused,
 } from "../core/state";
 import { dbg } from "../core/debug";
+import { HelpOverlay } from "./HelpOverlay";
 import { PaneView } from "./PaneView";
 import { StatusBar } from "./StatusBar";
 import { theme } from "./theme";
 
 const PREFIX_TIMEOUT_MS = 3000;
 
+function runAction(action: Action): void {
+  const focused = store.focusedPaneId;
+  switch (action) {
+    case "split-right":
+      splitPane(focused, "row");
+      return;
+    case "split-down":
+      splitPane(focused, "column");
+      return;
+    case "new-tab":
+      newTab(focused);
+      return;
+    case "next-tab":
+      cycleTab(focused, 1);
+      return;
+    case "prev-tab":
+      cycleTab(focused, -1);
+      return;
+    case "close-tab":
+      closeActiveTab();
+      return;
+    case "focus-left":
+      focusDirection("left");
+      return;
+    case "focus-right":
+      focusDirection("right");
+      return;
+    case "focus-up":
+      focusDirection("up");
+      return;
+    case "focus-down":
+      focusDirection("down");
+      return;
+    case "quit":
+      quit();
+      return;
+    case "help":
+      setHelpVisible(!store.helpVisible);
+      return;
+  }
+}
+
 export function App() {
+  const config = loadConfig();
+  const prefixChord = parseChord(config.keybinds.prefix);
+  // key string ("h", "left", "|") → action, from the merged config.
+  const actionByKey = new Map<string, Action>();
+  for (const action of ACTIONS) {
+    for (const key of keysForAction(config, action)) {
+      actionByKey.set(key, action);
+    }
+  }
+
   const dims = useTerminalDimensions();
   createEffect(() => {
     const d = dims();
@@ -42,11 +102,35 @@ export function App() {
     prefixTimer = setTimeout(disarm, PREFIX_TIMEOUT_MS);
   };
 
+  const isPrefix = (key: KeyEvent) =>
+    key.ctrl === prefixChord.ctrl &&
+    (key.option || key.meta) === prefixChord.alt &&
+    key.name === prefixChord.name;
+
   useKeyboard((key: KeyEvent) => {
     if (key.eventType === "release") return;
 
+    // Help overlay is modal: nothing reaches the pty while it's open.
+    if (store.helpVisible) {
+      if (isPrefix(key)) {
+        arm();
+        return;
+      }
+      if (store.prefixArmed) {
+        disarm();
+        if (actionByKey.get(key.sequence || key.name) === "help") {
+          setHelpVisible(false);
+          return;
+        }
+      }
+      if (key.name === "escape" || key.name === "q" || key.sequence === "?") {
+        setHelpVisible(false);
+      }
+      return;
+    }
+
     if (!store.prefixArmed) {
-      if (key.ctrl && key.name === "a") {
+      if (isPrefix(key)) {
         arm();
         return;
       }
@@ -56,57 +140,20 @@ export function App() {
     }
 
     disarm();
-    const focused = store.focusedPaneId;
-    const ch = key.sequence || key.name;
-    dbg("prefix cmd", { name: key.name, seq: key.sequence, ctrl: key.ctrl, focused });
+    dbg("prefix cmd", { name: key.name, seq: key.sequence, ctrl: key.ctrl });
 
-    if (key.ctrl && key.name === "a") {
-      writeToFocused("\x01"); // literal Ctrl+A
+    if (isPrefix(key)) {
+      // Prefix twice → send it literally.
+      writeToFocused(key.raw || key.sequence || "");
       return;
     }
-    if (ch === "|" || ch === "\\" || ch === "%") {
-      splitPane(focused, "row");
+    const action = actionByKey.get(key.sequence || key.name) ?? actionByKey.get(key.name);
+    if (action) {
+      runAction(action);
       return;
-    }
-    if (ch === "-" || ch === '"') {
-      splitPane(focused, "column");
-      return;
-    }
-    switch (key.name) {
-      case "c":
-        newTab(focused);
-        return;
-      case "n":
-        cycleTab(focused, 1);
-        return;
-      case "p":
-        cycleTab(focused, -1);
-        return;
-      case "x":
-        closeActiveTab();
-        return;
-      case "q":
-        quit();
-        return;
-      case "h":
-      case "left":
-        focusDirection("left");
-        return;
-      case "l":
-      case "right":
-        focusDirection("right");
-        return;
-      case "k":
-      case "up":
-        focusDirection("up");
-        return;
-      case "j":
-      case "down":
-        focusDirection("down");
-        return;
     }
     if (/^[1-9]$/.test(key.name)) {
-      selectTab(focused, Number(key.name) - 1);
+      selectTab(store.focusedPaneId, Number(key.name) - 1);
     }
   });
 
@@ -140,6 +187,9 @@ export function App() {
         }}
       </For>
       <StatusBar />
+      <Show when={store.helpVisible}>
+        <HelpOverlay />
+      </Show>
     </box>
   );
 }

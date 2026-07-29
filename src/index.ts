@@ -18,7 +18,8 @@ async function main(): Promise<void> {
   }
 
   // TUI mode: gt [--session <name>] [-- <command> [args...]]
-  let session = "main";
+  const { loadConfig } = await import("./core/config");
+  let session = loadConfig().general.session || "main";
   let command: string | undefined;
   let commandArgs: string[] = [];
   for (let i = 0; i < argv.length; i++) {

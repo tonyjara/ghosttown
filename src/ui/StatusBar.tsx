@@ -1,6 +1,14 @@
 import { Show, createMemo } from "solid-js";
+import { loadConfig } from "../core/config";
 import { store } from "../core/state";
 import { theme } from "./theme";
+
+function prefixHint(): string {
+  return loadConfig()
+    .keybinds.prefix.replace("ctrl+", "C-")
+    .replace("alt+", "M-")
+    .replace("shift+", "S-");
+}
 
 export function StatusBar() {
   const counts = createMemo(() => {
@@ -46,7 +54,7 @@ export function StatusBar() {
         <text content=" PREFIX " fg={theme.prefixFg} bg={theme.prefixBg} />
       </Show>
       <text content={` ${focusedTitle()} `} fg={theme.statusBarFg} bg={theme.statusBarBg} />
-      <text content=" C-a " fg={theme.idle} bg={theme.statusBarBg} />
+      <text content={` ${prefixHint()} ? `} fg={theme.idle} bg={theme.statusBarBg} />
     </box>
   );
 }

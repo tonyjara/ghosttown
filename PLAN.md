@@ -96,15 +96,18 @@ explicit signals, never guessed from text).
 ## MVP scope (v0.1)
 
 - [x] Research + stack verification
-- [ ] Panes with h/v splits, directional focus, click-to-focus, resize/reflow
-- [ ] **Per-pane tab strips**: new/close/cycle/select (keys + mouse)
-- [ ] Live shell/agent in every surface (default `$SHELL`, or any command)
-- [ ] Status glyphs per tab + status bar; unread badges; OSC 9 + desktop notifications
-- [ ] Query responder (DSR 6n/5n, DA1, XTVERSION, OSC 10/11, DECRQM, kitty query → 0)
-- [ ] Unix socket + `gt` CLI: list, split, new-tab, select-tab, close-tab,
+- [x] Panes with h/v splits, directional focus, click-to-focus, resize/reflow
+- [x] **Per-pane tab strips**: new/close/cycle/select (keys + mouse)
+- [x] Live shell/agent in every surface (default `$SHELL`, or any command)
+- [x] Status glyphs per tab + status bar; unread badges; desktop notifications
+- [x] Query responder (DSR 6n/5n, DA1, XTVERSION, OSC 10/11, DECRQM, kitty query → 0)
+- [x] Unix socket + `gt` CLI: list, split, new-tab, select-tab, close-tab,
       send-text, read-screen, report, notify
-- [ ] `gt hooks setup` for Claude Code
-- [ ] Scripted PTY harness test (app driven under bun-pty, frames snapshotted)
+- [x] `gt hooks setup` for Claude Code
+- [x] Scripted PTY harness test (app driven under bun-pty, frames snapshotted)
+- [x] TOML config: shipped defaults (`config.default.toml`) deep-merged with
+      `~/.config/ghosttown/config.toml`; keybinds fully remappable
+- [x] `prefix ?` floating help pane showing the merged keybinds
 
 ### Keybindings (prefix `Ctrl+A`, tmux-style; `Ctrl+A Ctrl+A` sends literal)
 

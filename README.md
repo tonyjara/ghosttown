@@ -44,9 +44,31 @@ emulation, renderer) ship prebuilt — no toolchain needed.
 | `1`–`9` | select tab N |
 | `x` | close tab (pane closes with its last tab) |
 | `q` | quit |
+| `?` | floating help pane with the effective keybinds |
 | `Ctrl+A` again | send a literal Ctrl+A |
 
 Mouse: click a pane to focus it, click a tab to select it.
+
+## Configuration
+
+Defaults live in [`config.default.toml`](config.default.toml) (documented
+inline). Override anything in `~/.config/ghosttown/config.toml` — your file
+only needs the values you change, and it always wins over the defaults.
+`$GHOSTTOWN_CONFIG` points at an alternate file, `$XDG_CONFIG_HOME` is
+respected.
+
+```toml
+# ~/.config/ghosttown/config.toml
+[keybinds]
+prefix = "ctrl+g"
+"new-tab" = ["t"]     # replaces the default list for that action
+
+[notifications]
+sound = "Ping"
+```
+
+`prefix ?` shows the *merged* keybinds, so the help pane always matches
+what your keys actually do.
 
 ## Agent status
 

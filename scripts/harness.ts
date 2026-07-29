@@ -5,6 +5,8 @@
  */
 import { spawn } from "bun-pty";
 import { PersistentTerminal } from "ghostty-opentui";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { OutputScanner } from "../src/core/queries";
 import { join } from "node:path";
 
@@ -12,6 +14,12 @@ const COLS = 100;
 const ROWS = 30;
 const session = `harness-${process.pid}`;
 const entry = join(import.meta.dir, "..", "src", "index.ts");
+
+// A user config override, to prove custom settings win over defaults:
+// new-tab remapped from "c" to "t".
+const configDir = mkdtempSync(join(tmpdir(), "gt-harness-config-"));
+const configPath = join(configDir, "config.toml");
+writeFileSync(configPath, `[keybinds]\n"new-tab" = ["t"]\n`);
 
 const term = new PersistentTerminal({ cols: COLS, rows: ROWS });
 const pty = spawn(process.execPath, ["--conditions=browser", "run", entry, "--session", session], {
@@ -26,6 +34,7 @@ const pty = spawn(process.execPath, ["--conditions=browser", "run", entry, "--se
     SHELL: "/bin/sh",
     TERM: "xterm-256color",
     GHOSTTOWN_NO_NOTIFY: "1",
+    GHOSTTOWN_CONFIG: configPath,
   },
 });
 
@@ -88,14 +97,15 @@ async function main(): Promise<void> {
   const tabMarkers = (text.match(/1:/g) ?? []).length;
   expect("two panes visible (two tab strips)", tabMarkers >= 2);
 
-  // New tab in the focused (new) pane.
+  // New tab in the focused (new) pane — via the USER-REMAPPED bind ("t",
+  // overriding the default "c" through GHOSTTOWN_CONFIG).
   pty.write(PREFIX);
   await sleep(120);
-  pty.write("c");
+  pty.write("t");
   await sleep(1200);
   text = term.getText();
   console.log(frame("after new tab"));
-  expect("second tab exists", text.includes("2:"));
+  expect("second tab exists (custom 't' bind)", text.includes("2:"));
 
   // Cycle back to tab 1.
   pty.write(PREFIX);
@@ -148,6 +158,31 @@ async function main(): Promise<void> {
   text = term.getText();
   console.log(frame("after heuristic done"));
   expect("heuristic marks done after quiet", text.includes("✓"));
+
+  // Help overlay: prefix+? opens, esc closes, input is modal meanwhile.
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("?");
+  await sleep(600);
+  text = term.getText();
+  console.log(frame("help overlay"));
+  expect("help overlay lists actions", text.includes("split pane right"));
+  expect("help overlay shows custom new-tab bind", /\bt\s+new tab in pane/.test(text));
+  pty.write("zzz"); // modal: must not reach the shell
+  await sleep(300);
+  pty.write("\x1b"); // esc closes
+  await sleep(500);
+  text = term.getText();
+  expect("help overlay closes on esc", !text.includes("split pane right"));
+  expect("modal input did not reach shell", !text.includes("zzz"));
+
+  // Override REPLACES the default list: "c" must no longer open a tab.
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("c");
+  await sleep(800);
+  text = term.getText();
+  expect("default 'c' bind replaced by override", !text.includes("3:"));
 
   // Resize: reflow to a wider grid.
   pty.resize(120, 34);

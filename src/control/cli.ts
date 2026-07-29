@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { loadConfig } from "../core/config";
 import { request } from "./client";
 import { socketPathFor } from "./protocol";
 import type { SessionSnapshot } from "../core/types";
@@ -72,7 +73,10 @@ function parseArgs(argv: string[]): Parsed {
 function findSocket(flags: Record<string, string | boolean>): string {
   if (typeof flags["socket"] === "string") return flags["socket"];
   if (process.env.GHOSTTOWN_SOCKET) return process.env.GHOSTTOWN_SOCKET;
-  const session = typeof flags["session"] === "string" ? flags["session"] : "main";
+  const session =
+    typeof flags["session"] === "string"
+      ? flags["session"]
+      : loadConfig().general.session || "main";
   return socketPathFor(session);
 }
 

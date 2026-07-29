@@ -4,6 +4,7 @@
  * Core rule: this module never imports from src/ui.
  */
 import { createStore, produce } from "solid-js/store";
+import { loadConfig } from "./config";
 import { dbg } from "./debug";
 import { computeRects, leaf, neighbor, removeLeaf, splitLeaf, collectPaneIds } from "./layout";
 import { desktopNotify } from "./notify";
@@ -27,6 +28,7 @@ interface StoreShape {
   /** Area available to panes (terminal minus the status bar row). */
   area: Rect;
   prefixArmed: boolean;
+  helpVisible: boolean;
 }
 
 let idCounter = 0;
@@ -42,6 +44,7 @@ export const [store, setStore] = createStore<StoreShape>({
   focusedPaneId: "",
   area: { x: 0, y: 0, width: 80, height: 23 },
   prefixArmed: false,
+  helpVisible: false,
 });
 
 let socketPath = "";
@@ -106,7 +109,7 @@ function applyStatus(surfaceId: string, status: AgentStatus): void {
 
 function spawnSurface(paneId: string, command?: string, args: string[] = []): string {
   const surfaceId = nextId("s");
-  const cmd = command ?? process.env.SHELL ?? "/bin/zsh";
+  const cmd = command || loadConfig().general.shell || process.env.SHELL || "/bin/zsh";
   const rects = currentRects();
   const rect = rects.get(paneId) ?? store.area;
 
@@ -348,6 +351,10 @@ export function writeToFocused(data: string): void {
 
 export function setPrefixArmed(armed: boolean): void {
   setStore("prefixArmed", armed);
+}
+
+export function setHelpVisible(visible: boolean): void {
+  setStore("helpVisible", visible);
 }
 
 /** Explicit status report from `gt report` (authoritative). */
