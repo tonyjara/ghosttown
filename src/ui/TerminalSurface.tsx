@@ -2,7 +2,7 @@ import { createEffect, onCleanup, onMount } from "solid-js";
 import { useRenderer } from "@opentui/solid";
 import type { BoxRenderable, RenderContext } from "@opentui/core";
 import { MOUSE_MODES_OFF } from "../core/mouse";
-import { registry } from "../core/state";
+import { dividerDragging, registry } from "../core/state";
 import { MuxTerminal } from "./MuxTerminal";
 
 /**
@@ -41,6 +41,8 @@ export function TerminalSurface(props: {
     term.attachMouse({
       modes: () => rt?.mouseModes() ?? MOUSE_MODES_OFF,
       report: (data) => rt?.reportMouse(data),
+      // A divider drag crossing this pane is not input for it.
+      grabbed: dividerDragging,
     });
   });
 
@@ -52,9 +54,19 @@ export function TerminalSurface(props: {
       term.rows = r;
     }
   });
+  /**
+   * The CONTAINER's visibility matters as much as the terminal's: every tab of a
+   * pane keeps one, they all cover the whole terminal area, and a visible box
+   * claims those cells in the hit grid whether or not anything is drawn in it.
+   * With the container left visible, the last tab's box sat on top of the
+   * active tab's terminal and swallowed every wheel notch — scrolling did
+   * nothing in any pane whose visible tab was not its last one, neither
+   * reaching the program (an agent) nor the pane's own scrollback.
+   */
   createEffect(() => {
     const v = props.visible;
     if (term) term.visible = v;
+    if (container) container.visible = v;
   });
   createEffect(() => {
     const s = props.showCursor;

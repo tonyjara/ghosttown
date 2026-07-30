@@ -151,6 +151,11 @@ export type HostClientFrame =
       command: string;
       args: string[];
       cwd: string;
+      /**
+       * "Start where this surface is." Resolved host-side, because only the host
+       * has the pid whose cwd to read; `cwd` above is the fallback.
+       */
+      cwdFrom?: string;
       env: Record<string, string>;
       cols: number;
       rows: number;

@@ -18,7 +18,7 @@ in the profile — found by looking at what is actually running, so an agent
 waiting at its prompt is listed too.
 
 ```
-┌ 1:claude ✳  2:zsh  + ──────────┬ 1:claude ⚑ ●  2:lazygit  + ────┐
+┌ 1:claude ✳ ×  2:zsh × + ───────┬ 1:claude ⚑ ● ×  2:lazygit × + ─┐
 │                                │                                │
 │  (claude working…)             │  (claude blocked on a          │
 │                                │   permission prompt)           │
@@ -53,7 +53,7 @@ emulation, renderer) ship prebuilt — no toolchain needed.
 | `-` | split down |
 | `h j k l` / arrows | focus pane by direction |
 | `r` | **resize mode** — `h j k l`/arrows move the divider, `esc` leaves |
-| `T` (shift+t) | new tab in the focused pane |
+| `T` (shift+t) | new tab in the focused pane — opens in the last tab's directory |
 | `n` / `p` | next / previous tab |
 | `1`–`9` | select tab N |
 | `D` (shift+d) | close tab — with its last tab, the pane closes too |
@@ -73,9 +73,17 @@ emulation, renderer) ship prebuilt — no toolchain needed.
 | `?` | floating help pane with the effective keybinds |
 | `Ctrl+A` again | send a literal Ctrl+A |
 
-Mouse: click a pane to focus it, click a tab to select it, click a sidebar
-row to move focus into the sidebar on that row (opening the workspace /
-revealing the agent), **drag the gap between panes to resize them**.
+Mouse: click a pane to focus it, click a tab to select it, click the `×` at a
+tab's right end to close it (double-click the strip's `+` to open one), click a
+sidebar row to move focus into the sidebar on that row (opening the workspace /
+revealing the agent), **drag the divider between panes to resize them** — the
+gap is drawn as a seam and lights up under the pointer. It stays a drag even
+when it crosses a pane whose program owns the mouse.
+
+Paste and drag-and-drop go to the focused pane: dropping a file on the window
+types its path into whatever is running there (that is a bracketed paste, which
+is how your terminal delivers a drop), and it is bracketed on the way to the
+program only if that program asked for `?2004`.
 
 Profiles are sessions: switching jumps this terminal to another session's
 daemon (starting it if needed) while the current one keeps running detached —
@@ -175,7 +183,7 @@ running in a pane.
 [appearance]
 theme = "tokyonight"         # default catppuccin-mocha; also catppuccin-latte,
                              # ghosttown, gruvbox, nord, dracula
-pane_gap = 1                 # cells between panes (they double as drag handles)
+pane_gap = 1                 # cells between panes (the divider you drag to resize)
 cursor_blink = true
 
 [theme]                      # optional per-color overrides on the theme

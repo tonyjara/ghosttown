@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
+import { For, Index, Show, createEffect, createMemo, createSignal } from "solid-js";
 import { useKeyboard, usePaste, useTerminalDimensions } from "@opentui/solid";
 import type { KeyEvent } from "@opentui/core";
 import {
@@ -9,7 +9,6 @@ import {
   parseChord,
   type Action,
 } from "../core/config";
-import type { Gutter } from "../core/layout";
 import {
   activeGutters,
   allRects,
@@ -27,6 +26,7 @@ import {
   dialogConfirm,
   dialogMove,
   dragDivider,
+  endDividerDrag,
   focusDirection,
   focusedPaneId,
   isFinderDialog,
@@ -40,6 +40,7 @@ import {
   openRenameTab,
   openRenameWorkspace,
   openSwitchProfile,
+  pasteToFocused,
   quit,
   reloadApp,
   resizeFocused,
@@ -54,6 +55,7 @@ import {
   sidebarMove,
   sidebarRename,
   splitPane,
+  startDividerDrag,
   store,
   toggleSidebar,
   workspaceOf,
@@ -382,10 +384,14 @@ export function App() {
     }
   });
 
+  // Pastes — and file drops, which every terminal delivers as one — arrive
+  // here rather than as keys, because opentui enables ?2004 on the host and
+  // parses the brackets out. A PasteEvent carries `bytes`, NOT text: reading a
+  // `.text` that does not exist is how dropping a file onto a pane did nothing.
   usePaste((event) => {
-    const text: string = (event as unknown as { text: string }).text ?? "";
+    const text = new TextDecoder().decode(event.bytes);
     if (text && !store.dialog && !store.sidebar.focused && !store.resizeMode) {
-      writeToFocused(`\x1b[200~${text}\x1b[201~`);
+      pasteToFocused(text);
     }
   });
 
@@ -398,10 +404,12 @@ export function App() {
     return allRects();
   });
 
-  // Divider drag: mousedown on a gutter starts a session; the ROOT box sees
-  // every drag/up event via bubbling (capture may land on whatever renderable
-  // the pointer is over, but propagation always reaches the root).
-  const [draggingGutter, setDraggingGutter] = createSignal<Gutter | null>(null);
+  // Divider drag: mousedown on a gutter starts a session (in the store, so the
+  // panes know not to touch the mouse while it runs); the ROOT box sees every
+  // drag/up event via bubbling. Opentui captures the renderable the pointer is
+  // over on the FIRST drag event and dispatches the rest of the drag to it, so
+  // the target is either a gutter or a pane — either way propagation reaches
+  // the root, as long as the captured renderable stays alive (see <Index>).
   const [hoveredGutter, setHoveredGutter] = createSignal<string | null>(null);
   const gutters = createMemo(() => {
     void store.screen.width;
@@ -410,18 +418,36 @@ export function App() {
     void store.workspaces[store.activeWorkspaceId]?.layout;
     return activeGutters().filter((g) => g.rect.width > 0 && g.rect.height > 0);
   });
+  const onGutter = (x: number, y: number) =>
+    gutters().some(
+      (g) =>
+        x >= g.rect.x &&
+        x < g.rect.x + g.rect.width &&
+        y >= g.rect.y &&
+        y < g.rect.y + g.rect.height,
+    );
 
   return (
     <box
       width="100%"
       height="100%"
       backgroundColor={theme.bg}
-      onMouseDrag={(e: { x: number; y: number }) => {
-        const g = draggingGutter();
-        if (g) dragDivider(g, g.dir === "row" ? e.x : e.y);
+      onMouseDrag={(e: { x: number; y: number }) => dragDivider(e.x, e.y)}
+      onMouseUp={endDividerDrag}
+      onMouseDragEnd={endDividerDrag}
+      onMouseDrop={endDividerDrag}
+      // Insurance, and it matters more than it sounds: a drag whose release
+      // never arrives — released outside the window, or the event was lost —
+      // would go on swallowing the mouse in every pane, and scrolling inside
+      // an agent would simply stop working until the next click. So anything
+      // that cannot be part of a drag ends it: a wheel notch, buttonless
+      // motion (nothing is held), or a press off the gutters (a press ON one
+      // starts the next drag, below).
+      onMouseScroll={endDividerDrag}
+      onMouseMove={endDividerDrag}
+      onMouseDown={(e: { x: number; y: number }) => {
+        if (!onGutter(e.x, e.y)) endDividerDrag();
       }}
-      onMouseUp={() => setDraggingGutter(null)}
-      onMouseDragEnd={() => setDraggingGutter(null)}
     >
       <For each={Object.keys(store.panes)}>
         {(paneId) => {
@@ -445,27 +471,36 @@ export function App() {
           );
         }}
       </For>
-      <For each={gutters()}>
+      {/*
+        Index, not For: the gutter list is rebuilt on every ratio change, and
+        For (keyed by reference) would destroy and recreate these boxes mid-
+        drag. Opentui had captured one of them, so the drag died after a single
+        cell — which is exactly what a careful, one-cell-at-a-time drag does.
+        Index reuses the renderables and only updates their props.
+      */}
+      <Index each={gutters()}>
         {(g) => (
           <box
             position="absolute"
-            left={g.rect.x}
-            top={g.rect.y}
-            width={g.rect.width}
-            height={g.rect.height}
+            left={g().rect.x}
+            top={g().rect.y}
+            width={g().rect.width}
+            height={g().rect.height}
+            // The gap is the drag handle, so it has to look like one: a seam
+            // at rest, lit on hover, accent while it is being dragged.
             backgroundColor={
-              draggingGutter()?.path === g.path
+              store.dividerDrag?.path === g().path
                 ? theme.accent
-                : hoveredGutter() === g.path
+                : hoveredGutter() === g().path
                   ? theme.sidebarSelBg
-                  : theme.bg
+                  : theme.stripBg
             }
-            onMouseDown={() => setDraggingGutter(g)}
-            onMouseOver={() => setHoveredGutter(g.path)}
-            onMouseOut={() => setHoveredGutter((h) => (h === g.path ? null : h))}
+            onMouseDown={() => startDividerDrag(g())}
+            onMouseOver={() => setHoveredGutter(g().path)}
+            onMouseOut={() => setHoveredGutter((h) => (h === g().path ? null : h))}
           />
         )}
-      </For>
+      </Index>
       <Show when={store.sidebar.visible}>
         <Sidebar />
       </Show>

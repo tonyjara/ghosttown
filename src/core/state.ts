@@ -135,6 +135,13 @@ interface StoreShape {
   prefixArmed: boolean;
   /** Prefix+r toggles this; h/j/k/l then move dividers until esc/enter. */
   resizeMode: boolean;
+  /**
+   * The divider a mouse drag is moving right now. It lives here rather than in
+   * the component because the panes have to know: while a drag is running the
+   * mouse belongs to it, and a surface the pointer crosses must not forward
+   * the events to its program.
+   */
+  dividerDrag: Gutter | null;
   helpVisible: boolean;
   sidebar: SidebarState;
   dialog: DialogState | null;
@@ -156,6 +163,7 @@ export const [store, setStore] = createStore<StoreShape>({
   screen: { width: 80, height: 24 },
   prefixArmed: false,
   resizeMode: false,
+  dividerDrag: null,
   helpVisible: false,
   sidebar: {
     visible: true,
@@ -525,6 +533,8 @@ function spawnSurface(
   command?: string,
   args: string[] = [],
   cwd?: string,
+  /** Surface to start next to, directory-wise; the host resolves it. */
+  cwdFrom?: string,
 ): string {
   const surfaceId = nextId("s");
   const cmd = command || loadConfig().general.shell || process.env.SHELL || "/bin/zsh";
@@ -554,6 +564,7 @@ function spawnSurface(
     // The host drops a cwd that no longer exists; it may have been deleted
     // between the snapshot and now.
     cwd: cwd ?? process.cwd(),
+    cwdFrom,
     env: surfaceEnv(paneId, surfaceId),
     cols: rect.width,
     rows: rect.height - 1,
@@ -1020,8 +1031,29 @@ export function resizeFocused(dir: "left" | "right" | "up" | "down"): void {
   applyDivider(ws.id, target, target.aw + delta);
 }
 
-/** Mouse drag on a gutter: put the divider at the pointer's cell. */
-export function dragDivider(gutter: Gutter, pointer: number): void {
+/** Mouse-down on a gutter: everything until the release moves this divider. */
+export function startDividerDrag(gutter: Gutter): void {
+  setStore("dividerDrag", gutter);
+}
+
+export function endDividerDrag(): void {
+  if (store.dividerDrag) setStore("dividerDrag", null);
+}
+
+/** True while a divider is being dragged — the mouse belongs to the drag. */
+export function dividerDragging(): boolean {
+  return store.dividerDrag !== null;
+}
+
+/**
+ * A pointer position during a divider drag: put the divider under it. The
+ * gutter captured at mouse-down keeps describing its split for the whole drag
+ * — moving a divider changes its own ratio, never the split's origin or size.
+ */
+export function dragDivider(x: number, y: number): void {
+  const gutter = store.dividerDrag;
+  if (!gutter) return;
+  const pointer = gutter.dir === "row" ? x : y;
   applyDivider(store.activeWorkspaceId, gutter, pointer - gutter.start);
 }
 
@@ -1056,7 +1088,10 @@ export function splitPane(paneId: string, dir: SplitDir, command?: string, args?
 export function newTab(paneId: string, command?: string, args?: string[]): string | null {
   const pane = store.panes[paneId];
   if (!pane) return null;
-  const surfaceId = spawnSurface(paneId, command, args ?? []);
+  // Tabs are appended, so the one to the new tab's left is the last one — and
+  // that is the directory to open in, not wherever the TUI itself was started.
+  const leftOf = pane.surfaceIds[pane.surfaceIds.length - 1];
+  const surfaceId = spawnSurface(paneId, command, args ?? [], undefined, leftOf);
   setStore(
     produce((s) => {
       const p = s.panes[paneId]!;
@@ -1277,6 +1312,15 @@ export function focusedRuntime(): SurfaceRuntime | undefined {
 
 export function writeToFocused(data: string): void {
   focusedRuntime()?.write(data);
+}
+
+/**
+ * Paste (or a file dropped on the window, which the host terminal delivers as
+ * one) goes to the focused pane as a paste, not as typing — see
+ * SurfaceRuntime.paste.
+ */
+export function pasteToFocused(text: string): void {
+  focusedRuntime()?.paste(text);
 }
 
 // ---------------------------------------------------------------------------

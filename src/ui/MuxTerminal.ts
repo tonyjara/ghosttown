@@ -99,12 +99,20 @@ export const LNM_OFF = "\x1b[20l";
 export interface MouseDelegate {
   modes: () => MouseModes;
   report: (data: string) => void;
+  /**
+   * True while the mouse belongs to something outside the pane — a pane
+   * divider being dragged. The pointer crosses surfaces on its way, and
+   * neither the pane nor its program may act on those events.
+   */
+  grabbed?: () => boolean;
 }
 
 export class MuxTerminal extends GhosttyTerminalRenderable {
   private scrollUp = 0;
   private prevTotal = 0;
   private mouse: MouseDelegate | null = null;
+  /** Whether this surface holds a press the program has not been released of. */
+  private pressed = false;
 
   constructor(...args: ConstructorParameters<typeof GhosttyTerminalRenderable>) {
     super(...args);
@@ -150,8 +158,36 @@ export class MuxTerminal extends GhosttyTerminalRenderable {
     appliedCursorStyle = "";
   }
 
+  /**
+   * Keep the program's idea of the buttons honest. Opentui ends a drag with
+   * more than one event and to more than one renderable — `drag-end` and `up`
+   * to whichever it captured, `drop` and `up` to whichever is under the
+   * pointer — and a release for a press the program never saw leaves it
+   * believing a button is still down. False means "do not forward this one".
+   */
+  private trackPress(type: MouseReport["type"]): boolean {
+    if (type === "down") {
+      this.pressed = true;
+      return true;
+    }
+    if (type === "up" || type === "drag-end" || type === "drop") {
+      if (!this.pressed) return false;
+      this.pressed = false;
+    }
+    return true;
+  }
+
   protected override onMouseEvent(event: MouseReport & { x: number; y: number }): void {
+    // A pane divider is being dragged across us. Returning without calling
+    // super still bubbles, and the drag listens at the root.
+    //
+    // A wheel notch is exempt: it cannot be part of a drag, and if one shows up
+    // while a drag is still "running" then that drag's release went missing.
+    // Swallowing it would cost the pane the notch AND read as "scrolling is
+    // broken" for as long as the stale drag lasts. The root ends it.
+    if (event.type !== "scroll" && this.mouse?.grabbed?.()) return;
     if (this.mouse && this.appOwnsMouse()) {
+      if (!this.trackPress(event.type)) return;
       // Pane-local, 1-based — what the protocol expects.
       const data = encodeMouseEvent(
         { ...event, col: event.x - this.x + 1, row: event.y - this.y + 1 },

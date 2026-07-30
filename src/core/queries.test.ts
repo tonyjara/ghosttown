@@ -40,8 +40,22 @@ describe("OutputScanner", () => {
 
   it("answers DECRQM for sync mode", () => {
     const { scanner, responses } = makeScanner();
-    scanner.scan("\x1b[?2026$p\x1b[?2004$p");
-    expect(responses).toEqual(["\x1b[?2026;2$y", "\x1b[?2004;0$y"]);
+    scanner.scan("\x1b[?2026$p\x1b[?9999$p");
+    expect(responses).toEqual(["\x1b[?2026;2$y", "\x1b[?9999;0$y"]);
+  });
+
+  it("tracks bracketed paste and answers DECRQM for it", () => {
+    const { scanner, responses } = makeScanner();
+    expect(scanner.pasteMode()).toBe(false);
+    scanner.scan("\x1b[?2004$p");
+    expect(responses).toEqual(["\x1b[?2004;2$y"]);
+    responses.length = 0;
+    scanner.scan("\x1b[?1049;2004h");
+    expect(scanner.pasteMode()).toBe(true);
+    scanner.scan("\x1b[?2004$p");
+    expect(responses).toEqual(["\x1b[?2004;1$y"]);
+    scanner.scan("\x1b[?2004l");
+    expect(scanner.pasteMode()).toBe(false);
   });
 
   it("answers OSC 11 background query matching the terminator", () => {

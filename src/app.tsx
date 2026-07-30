@@ -156,7 +156,18 @@ export async function startApp(opts: {
   await render(() => <Root />, {
     exitOnCtrlC: false,
     useMouse: true,
-    useKittyKeyboard: null,
+    // Every flag OFF, and it has to be spelled out: opentui reads this option
+    // as `config.useKittyKeyboard ?? {}`, so `null` — which the type allows and
+    // which reads as "no kitty keyboard" — lands on the default-ON config and
+    // pushes `CSI > 5 u` to the host terminal.
+    //
+    // A mux must not enable it. We forward the bytes a keypress arrived as
+    // straight to the child pty, and children are told kitty is unsupported
+    // (core/queries answers `CSI ? u` with `CSI ? 0 u`). With the protocol on,
+    // a kitty-capable host sends ctrl+c as `CSI 99;5u` and that is what the
+    // child received: no SIGINT, just `^[[99;5u` printed at the prompt. Same
+    // for escape (`CSI 27 u`), every other ctrl chord, and alt chords.
+    useKittyKeyboard: { disambiguate: false, alternateKeys: false },
     targetFps: 30,
   });
 }

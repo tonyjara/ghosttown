@@ -327,6 +327,20 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     agentTimer = setInterval(() => void pollAgents(), every);
   }
 
+  /**
+   * Where a sibling surface is sitting right now. A new tab starts next to the
+   * one before it, so this is read live rather than taken from the snapshot —
+   * the last save can predate a `cd`. Blocking, but it is one lsof (~40ms, and
+   * a readlink on Linux) per new tab, on the daemon rather than the render loop.
+   */
+  const cwdOfSurface = (id: string): string | null => {
+    const pid = surfaces.get(id)?.pty?.pid;
+    const live = pid ? readCwds([pid]).get(pid) : undefined;
+    // No pid (it exited), or lsof failed: the snapshot's last known directory
+    // for it still beats falling back to wherever the daemon was started.
+    return live ?? cwdsOf(layout).get(id) ?? null;
+  };
+
   const spawnSurface = (frame: Extract<HostClientFrame, { t: "spawn" }>): void => {
     if (surfaces.has(frame.id)) return;
     const cols = Math.max(2, frame.cols);
@@ -377,12 +391,15 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     });
     surfaces.set(s.id, s);
 
+    // A directory can be deleted under a live shell, so whichever one we land
+    // on has to be checked before handing it to the pty.
+    const wanted = (frame.cwdFrom && cwdOfSurface(frame.cwdFrom)) || frame.cwd;
     try {
       s.pty = spawn(frame.command, frame.args, {
         name: "xterm-256color",
         cols,
         rows,
-        cwd: frame.cwd && existsSync(frame.cwd) ? frame.cwd : process.cwd(),
+        cwd: wanted && existsSync(wanted) ? wanted : process.cwd(),
         env: frame.env,
       });
     } catch (err) {

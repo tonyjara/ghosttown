@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPtyHost, ReplayBuffer, type Sender } from "./ptyhost";
@@ -300,6 +300,47 @@ describe("pty host", () => {
     received = [];
     feed({ t: "hello", persist: false });
     expect(framesOf("boot")[0]!.surfaces[0]!.everAgent).toBe(false);
+  });
+
+  it("starts a surface in the live directory of the one it inherits from", async () => {
+    feed({ t: "hello", persist: false });
+    mkdirSync(join(stateDir, "inherit-me"));
+    spawnSh("s1");
+    // The `cd` is the point: the sibling's directory has to be read now, not
+    // taken from a snapshot written before it moved.
+    feed({ t: "w", id: "s1", d: encode("cd inherit-me && echo moved\n") });
+    expect(await until(() => outputOf("s1").includes("moved"))).toBe(true);
+
+    feed({
+      t: "spawn",
+      id: "s2",
+      command: "/bin/sh",
+      args: [],
+      cwd: stateDir,
+      cwdFrom: "s1",
+      env: { TERM: "xterm-256color", PS1: "$ " },
+      cols: 40,
+      rows: 10,
+    });
+    feed({ t: "w", id: "s2", d: encode("pwd\n") });
+    expect(await until(() => outputOf("s2").includes("/inherit-me"))).toBe(true);
+  });
+
+  it("falls back to the frame's cwd when there is nothing to inherit from", async () => {
+    feed({ t: "hello", persist: false });
+    feed({
+      t: "spawn",
+      id: "s1",
+      command: "/bin/sh",
+      args: [],
+      cwd: stateDir,
+      cwdFrom: "gone",
+      env: { TERM: "xterm-256color", PS1: "$ " },
+      cols: 40,
+      rows: 10,
+    });
+    feed({ t: "w", id: "s1", d: encode("pwd\n") });
+    expect(await until(() => outputOf("s1").includes("gt-host-"))).toBe(true);
   });
 
   const layout = (surfaceId: string): PersistedSession => ({

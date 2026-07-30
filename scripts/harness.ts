@@ -53,6 +53,8 @@ process.env.GHOSTTOWN_STATE_DIR = join(configDir, "state");
 // purpose — a unix socket path is capped at ~104 bytes.
 const socketDir = `/tmp/gt-harness-${process.pid}`;
 mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+/** A shell cd's here to prove a new tab opens in its neighbour's directory. */
+const inheritDir = join(socketDir, "inh");
 process.env.GHOSTTOWN_SOCKET_DIR = socketDir;
 
 const attachSocket = attachSocketPathFor(session);
@@ -134,7 +136,10 @@ const scanner = new OutputScanner({
 });
 
 let exited = false;
+/** Everything the TUI wrote to its "terminal" — for asserting on sequences. */
+let hostBytes = "";
 pty.onData((chunk) => {
+  hostBytes += chunk;
   scanner.scan(chunk);
   term.feed(chunk);
 });
@@ -155,9 +160,10 @@ function frame(label: string, t: PersistentTerminal = term): string {
 }
 
 const failures: string[] = [];
-function expect(label: string, cond: boolean): void {
-  console.log(`[harness] ${cond ? "PASS" : "FAIL"}: ${label}`);
-  if (!cond) failures.push(label);
+function expect(label: string, cond: boolean, detail = ""): void {
+  const suffix = detail && !cond ? ` (${detail})` : "";
+  console.log(`[harness] ${cond ? "PASS" : "FAIL"}: ${label}${suffix}`);
+  if (!cond) failures.push(label + suffix);
 }
 
 const PREFIX = "\x01"; // Ctrl+A
@@ -181,6 +187,36 @@ async function main(): Promise<void> {
       bgs.has("#1e1e2e") || bgs.has("#181825"),
     );
   }
+
+  // --- Kitty keyboard protocol stays off ---
+  // A keypress is forwarded to the child as the bytes it arrived as, and
+  // children are told kitty is unsupported (queries answers `CSI ? u` with
+  // `CSI ? 0 u`). So the host must not be asked for it either: with the
+  // protocol on, ctrl+c arrives as `CSI 99;5u` and that is what the child
+  // gets — no SIGINT, just `^[[99;5u` at the prompt. Same for escape and
+  // every other ctrl/alt chord. See the render options in src/app.tsx.
+  {
+    const pushes = [...hostBytes.matchAll(/\x1b\[[>=]([\d;]*)u/g)].map((m) => m[1]);
+    expect(
+      "no kitty keyboard enhancements are pushed to the host",
+      pushes.every((flags) => !flags || /^0+$/.test(flags)),
+      `pushed ${JSON.stringify(pushes)}`,
+    );
+  }
+
+  // And the byte itself: ctrl+c must reach the child as 0x03, so that sending
+  // SIGINT is the pty's job. Raw mode (no isig) keeps the reader alive to show
+  // it, and `head -c 1` ends the pipeline after exactly one keypress.
+  pty.write("stty raw -echo; head -c 1 | cat -v; stty sane\r");
+  await sleep(900);
+  pty.write("\x03");
+  await sleep(600);
+  expect(
+    "ctrl+c arrives at the child as 0x03, not an escape sequence",
+    term.getText().includes("^C"),
+  );
+  pty.write("\r");
+  await sleep(500);
 
   // Type into the shell.
   pty.write("echo hello_ghosttown\r");
@@ -276,6 +312,13 @@ async function main(): Promise<void> {
   const tabMarkers = (text.match(/1:/g) ?? []).length;
   expect("two panes visible (two tab strips)", tabMarkers >= 2);
 
+  // A new tab opens where the tab to its left is sitting, so move that shell
+  // somewhere recognizable first. Short path on purpose: a ~48-column pane
+  // wraps a long `pwd` and the assertion below would never see it whole.
+  mkdirSync(inheritDir, { recursive: true });
+  pty.write(`cd ${inheritDir}\r`);
+  await sleep(700);
+
   // New tab in the focused (new) pane — via the USER-REMAPPED bind ("t",
   // overriding the default "c" through GHOSTTOWN_CONFIG).
   pty.write(PREFIX);
@@ -285,6 +328,13 @@ async function main(): Promise<void> {
   text = term.getText();
   console.log(frame("after new tab"));
   expect("second tab exists (custom 't' bind)", text.includes("2:"));
+
+  pty.write("pwd\r");
+  await sleep(900);
+  text = term.getText();
+  console.log(frame("new tab's directory"));
+  // /tmp is a symlink on macOS, and the host reads the physical path.
+  expect("new tab inherits the previous tab's directory", /\/inh\b/.test(text));
 
   // prefix+D (close-tab) kills the active tab; the pane lives on while it
   // still has tabs. Re-created right after, so the counts below hold.
@@ -325,11 +375,17 @@ async function main(): Promise<void> {
     text = term.getText();
     console.log(frame("after double-clicking +"));
     expect("double click on + opens a tab in that pane", text.includes("3:"));
-    pty.write(PREFIX);
-    await sleep(120);
-    pty.write("D");
+
+    // --- A tab's own × ----------------------------------------------------
+    // One click, on the tab it belongs to: the rightmost × on the strip is the
+    // tab just opened. prefix+D is tested above; this is the mouse route.
+    const closeCol = (term.getText().split("\n")[0] ?? "").lastIndexOf("×") + 1;
+    expect("tabs show an × affordance", closeCol > 0);
+    click(closeCol, 1);
     await sleep(1000);
-    expect("the + tab closes again", !term.getText().includes("3:"));
+    console.log(frame("after clicking a tab's ×"));
+    expect("clicking × closes that tab", !term.getText().includes("3:"));
+    expect("the other tabs stay", term.getText().includes("2:"));
   }
 
   // Cycle back to tab 1.
@@ -455,6 +511,145 @@ async function main(): Promise<void> {
       "resize mode h grew the focused right pane",
       !!before && !!after && after.w >= before.w + 4,
     );
+  }
+
+  // --- Dragging the divider with the mouse --------------------------------
+  {
+    const leftOf = (rs: Map<string, { w: number; h: number; x: number; y: number }>) =>
+      [...rs.values()].sort((a, b) => a.x - b.x)[0]!;
+    const left = leftOf(rectsAfter);
+    const gutterCol = left.x + left.w; // 0-based column of the gap
+    const midRow = left.y + Math.floor(left.h / 2);
+
+    // The gap is the drag handle, so it has to be visible: it is painted with
+    // the strip color, not the background the panes sit on.
+    const bgAt = (col: number, row: number): string => {
+      const total = term.getJson({ limit: 1 }).totalLines;
+      const line = term.getJson({ offset: Math.max(0, total - ROWS), limit: ROWS }).lines[row];
+      let at = 0;
+      for (const span of line?.spans ?? []) {
+        at += span.text.length;
+        if (at > col) return (span.bg ?? "").toLowerCase();
+      }
+      return "";
+    };
+    const gutterBg = bgAt(gutterCol, midRow);
+    expect(
+      "the gap between panes is painted as a divider",
+      gutterBg !== "" && gutterBg !== bgAt(gutterCol - 2, midRow),
+      `gutter ${gutterBg} vs pane ${bgAt(gutterCol - 2, midRow)}`,
+    );
+
+    // A careful, one-cell-at-a-time drag: every motion event lands on the
+    // divider's NEW column, so opentui captures the gutter renderable itself.
+    // Rebuilding those renderables per frame used to kill the drag after a
+    // single cell — the whole feature looked broken to anyone who dragged
+    // slowly. Mouse reporting is on in this pane (the program owns the mouse),
+    // which must not change who the drag belongs to.
+    pty.write("printf '\\033[?1000h\\033[?1002h\\033[?1006h'; cat -v\r");
+    await sleep(900);
+    // The other pane still shows the escapes the mouse-reporting test asked
+    // for, so count rather than look for any.
+    const reports = (t: string) => (t.match(/\^\[\[</g) ?? []).length;
+    // A wheel notch inside the focused pane, before anything is dragged. It is
+    // the baseline the two assertions below are measured against — and it is a
+    // regression test in its own right: this pane has TWO tabs and the visible
+    // one is not the last, which is exactly the case where the hidden tab's
+    // container used to sit on top of it in the hit grid and eat the wheel. The
+    // symptom was that scrolling inside an agent did nothing at all.
+    const paneCol = COLS - 4;
+    const baseline = reports(term.getText());
+    pty.write(`\x1b[<64;${paneCol};${midRow + 1}M`);
+    await sleep(600);
+    expect(
+      "the wheel reaches the visible tab's program, not a hidden tab",
+      reports(term.getText()) > baseline,
+      `${baseline} → ${reports(term.getText())} mouse reports on screen`,
+    );
+    const reportsBefore = reports(term.getText());
+    const STEPS = 8;
+    pty.write(`\x1b[<0;${gutterCol + 1};${midRow + 1}M`); // press on the gutter
+    await sleep(150);
+    for (let i = 0; i <= STEPS; i++) {
+      pty.write(`\x1b[<32;${gutterCol + 1 - i};${midRow + 1}M`);
+      await sleep(70);
+    }
+    await sleep(200);
+    pty.write(`\x1b[<0;${gutterCol + 1 - STEPS};${midRow + 1}m`);
+    await sleep(700);
+    const dragged = leftOf(parseRects(await cli("list")));
+    console.log(frame("after dragging the divider left"));
+    expect(
+      "dragging the gutter moves the divider all the way",
+      dragged.w === left.w - STEPS,
+      `${left.w} → ${dragged.w}, wanted ${left.w - STEPS}`,
+    );
+    expect(
+      "a divider drag stays out of the pane's program",
+      reports(term.getText()) === reportsBefore,
+      `${reportsBefore} → ${reports(term.getText())} mouse reports on screen`,
+    );
+
+    // ...and a drag whose RELEASE never arrives must not leave the mouse
+    // wedged. Releasing outside the window looks exactly like this, and while
+    // the stale drag lasted every pane swallowed everything — scrolling inside
+    // an agent stopped working until the next click landed somewhere.
+    const stale = reports(term.getText());
+    pty.write(`\x1b[<0;${gutterCol + 1 - STEPS};${midRow + 1}M`); // press
+    await sleep(150);
+    pty.write(`\x1b[<32;${gutterCol - STEPS};${midRow + 1}M`); // one cell, no up
+    await sleep(300);
+    // Over the FOCUSED pane — the one running `cat -v` with the mouse on. It is
+    // the right half, so a column near the screen edge is inside it whatever
+    // the drag above did to the divider.
+    for (let i = 0; i < 3; i++) {
+      pty.write(`\x1b[<64;${paneCol};${midRow + 1}M`); // wheel up
+      await sleep(120);
+    }
+    await sleep(600);
+    console.log(frame("wheel after a drag that never got its release"));
+    expect(
+      "a lost mouse-up does not leave the panes deaf to the wheel",
+      reports(term.getText()) > stale,
+      `${stale} → ${reports(term.getText())} mouse reports on screen`,
+    );
+
+    pty.write("\x03"); // leave cat
+    await sleep(400);
+    pty.write("printf '\\033[?1000l\\033[?1002l\\033[?1006l'; clear\r");
+    await sleep(600);
+  }
+
+  // --- A file dropped on the window ---------------------------------------
+  // Every terminal delivers a drag-and-drop as a bracketed paste, which is how
+  // the path of a dropped file reaches an agent. `cat -v` never asks for ?2004,
+  // so it must get the text alone — the markers would be printed as garbage.
+  {
+    pty.write("cat -v\r");
+    await sleep(900);
+    const dropped = "/tmp/dropped by mouse.txt";
+    pty.write(`\x1b[200~${dropped}\x1b[201~`);
+    await sleep(700);
+    text = term.getText();
+    console.log(frame("after dropping a file on the pane"));
+    expect("a dropped file's path reaches the program", text.includes(dropped));
+    expect("...without the paste markers a program never asked for", !text.includes("^[[200~"));
+
+    // A program that DOES ask for bracketed paste gets the brackets, which is
+    // what tells it the newlines were pasted rather than typed.
+    pty.write("\x03");
+    await sleep(400);
+    pty.write("clear; printf '\\033[?2004h'; cat -v\r");
+    await sleep(900);
+    pty.write("\x1b[200~pasted line\x1b[201~");
+    await sleep(700);
+    text = term.getText();
+    console.log(frame("paste into a program that asked for ?2004"));
+    expect("a program that asked for ?2004 gets bracketed text", text.includes("^[[200~pasted line^[[201~"));
+    pty.write("\x03");
+    await sleep(300);
+    pty.write("printf '\\033[?2004l'; clear\r");
+    await sleep(600);
   }
 
   // Status reporting via socket (authoritative tier).

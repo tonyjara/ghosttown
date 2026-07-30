@@ -32,8 +32,9 @@ restore_session = true
 # Color theme. Built-in: catppuccin-mocha, catppuccin-latte, ghosttown,
 # tokyonight, gruvbox, nord, dracula.
 theme = "catppuccin-mocha"
-# Cells of spacing between panes. The gaps double as mouse drag-handles for
-# resizing. 0 = panes touch (drag-resize then needs resize mode).
+# Cells of spacing between panes. The gap is drawn as a divider and is the
+# handle you drag to resize; 2 makes it easier to grab with the mouse.
+# 0 = panes touch, and resizing is resize-mode only.
 pane_gap = 1
 # Blink the cursor in the focused pane.
 cursor_blink = true

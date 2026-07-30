@@ -1,5 +1,6 @@
 import { For, createSignal } from "solid-js";
-import { focusPane, newTab, selectTab, surfaceLabel } from "../core/state";
+import type { MouseEvent } from "@opentui/core";
+import { closeSurface, focusPane, newTab, selectTab, surfaceLabel } from "../core/state";
 import type { PaneState } from "../core/types";
 import { store } from "../core/state";
 import { statusGlyph, theme } from "./theme";
@@ -34,24 +35,48 @@ export function TabStrip(props: { pane: PaneState; focused: boolean }) {
           const meta = () => store.surfaces[sid];
           const active = () => idx() === props.pane.activeIdx;
           const glyph = () => statusGlyph(meta()?.status ?? "idle");
+          const [closeHot, setCloseHot] = createSignal(false);
           const label = () => {
             const m = meta();
             if (!m) return "";
             const g = glyph().glyph;
             const dot = m.unread ? "●" : "";
-            return ` ${idx() + 1}:${surfaceLabel(m).slice(0, 18)}${g ? " " + g : ""}${dot ? " " + dot : ""} `;
+            return ` ${idx() + 1}:${surfaceLabel(m).slice(0, 18)}${g ? " " + g : ""}${dot ? " " + dot : ""}`;
+          };
+          const bg = () => (active() ? theme.tabBgActive : stripBg());
+          /**
+           * Closing is one click, on any tab — so it must not also read as
+           * "focus this pane" on the way out: the pane may be gone by then
+           * (a pane closes with its last tab).
+           */
+          const onCloseDown = (e: MouseEvent) => {
+            e.stopPropagation();
+            closeSurface(sid);
           };
           return (
-            <text
-              content={label()}
-              fg={active() ? theme.tabFgActive : glyph().glyph ? glyph().color : theme.tabFg}
-              bg={active() ? theme.tabBgActive : stripBg()}
-              selectable={false}
-              onMouseDown={() => {
-                focusPane(props.pane.id);
-                selectTab(props.pane.id, idx());
-              }}
-            />
+            <box height={1} flexDirection="row" backgroundColor={bg()} flexShrink={0}>
+              <text
+                content={label()}
+                fg={active() ? theme.tabFgActive : glyph().glyph ? glyph().color : theme.tabFg}
+                bg={bg()}
+                selectable={false}
+                onMouseDown={() => {
+                  focusPane(props.pane.id);
+                  selectTab(props.pane.id, idx());
+                }}
+              />
+              {/* Always there, so tabs never shift under the pointer; it lights
+                  up on hover, which is what says it is a button and not decoration. */}
+              <text
+                content=" × "
+                fg={closeHot() ? theme.blocked : active() ? theme.tabFgActive : theme.idle}
+                bg={bg()}
+                selectable={false}
+                onMouseDown={onCloseDown}
+                onMouseOver={() => setCloseHot(true)}
+                onMouseOut={() => setCloseHot(false)}
+              />
+            </box>
           );
         }}
       </For>

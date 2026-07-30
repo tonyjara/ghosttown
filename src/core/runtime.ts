@@ -29,9 +29,29 @@ export interface SpawnSpec {
   command: string;
   args: string[];
   cwd: string;
+  /** Surface whose live directory to start in, if it still has one. */
+  cwdFrom?: string;
   env: Record<string, string>;
   cols: number;
   rows: number;
+}
+
+/** Bytes of output carried between chunks so a split escape still matches. */
+const MODE_TAIL = 16;
+
+/**
+ * Whether bracketed paste is on after `text`: the last ?2004 set/reset in it,
+ * or `prev` when it contains none. DECSET can carry several modes at once
+ * (claude sends `?1049;2004h`-style batches), hence the split.
+ */
+export function scanPasteMode(prev: boolean, text: string): boolean {
+  let on = prev;
+  const re = /\x1b\[\?([\d;]+)([hl])/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    for (const code of m[1]!.split(";")) if (code === "2004") on = m[2] === "h";
+  }
+  return on;
 }
 
 /** How a runtime reaches the host. Set once at startup by app.tsx. */
@@ -56,6 +76,9 @@ export class SurfaceRuntime {
    * host is building, so feeding it first would show it twice.
    */
   private awaitingSnapshot = false;
+  /** ?2004: whether the program wants pasted text bracketed (see paste). */
+  private bracketedPaste = false;
+  private modeTail = "";
 
   constructor(readonly id: string) {}
 
@@ -67,6 +90,7 @@ export class SurfaceRuntime {
       command: spec.command,
       args: spec.args,
       cwd: spec.cwd,
+      cwdFrom: spec.cwdFrom,
       env: spec.env,
       cols: Math.max(2, spec.cols),
       rows: Math.max(1, spec.rows),
@@ -101,13 +125,30 @@ export class SurfaceRuntime {
   /** Live output from the host. */
   feed(data: string): void {
     if (this.awaitingSnapshot) return;
+    this.trackPasteMode(data);
     this.renderable?.feed(data);
   }
 
   /** The replay buffer, in one piece: everything this surface has printed. */
   feedSnapshot(data: string): void {
     this.awaitingSnapshot = false;
-    if (data) this.renderable?.feed(data);
+    if (!data) return;
+    // The replay carries the program's ?2004 with it (the host even re-sends
+    // trimmed-away modes as a prelude), so an adopted surface knows how to
+    // paste without waiting for the program to say it again.
+    this.trackPasteMode(data);
+    this.renderable?.feed(data);
+  }
+
+  /**
+   * Follow ?2004 in the program's own output. A sequence can straddle two
+   * chunks, so a short tail is carried and re-scanned; re-applying a mode we
+   * already saw is harmless, and the last one in the scan wins.
+   */
+  private trackPasteMode(data: string): void {
+    const text = this.modeTail + data;
+    this.modeTail = text.slice(-MODE_TAIL);
+    this.bracketedPaste = scanPasteMode(this.bracketedPaste, text);
   }
 
   write(data: string): void {
@@ -115,6 +156,21 @@ export class SurfaceRuntime {
     // Typing while scrolled back would send keys to a screen you cannot see.
     this.renderable?.snapToLive();
     sendToHost({ t: "w", id: this.id, d: Buffer.from(data).toString("base64") });
+  }
+
+  /**
+   * Pasted or dropped text. The markers are what tell an agent or an editor
+   * "this arrived at once, do not act on the newlines" — and they may only be
+   * sent to a program that asked for them, since to anything else they are just
+   * bytes for `cat` to print.
+   *
+   * Deciding that here rather than in the pty host is deliberate: the TUI reads
+   * every byte the program prints anyway, and the host is long-lived — prefix+R
+   * restarts the TUI against a daemon that can be days older, and a paste must
+   * not depend on that daemon knowing a newer frame.
+   */
+  paste(text: string): void {
+    this.write(this.bracketedPaste ? `\x1b[200~${text}\x1b[201~` : text);
   }
 
   /** Mouse reporting this surface's program has asked for (host-tracked). */

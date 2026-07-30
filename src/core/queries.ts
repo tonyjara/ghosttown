@@ -44,12 +44,22 @@ const PRIVATE_MODE = /\x1b\[\?([\d;]+)([hl])/g;
 export class OutputScanner {
   private carry = "";
   private modes: MouseModes = MOUSE_MODES_OFF;
+  private bracketedPaste = false;
 
   constructor(private hooks: ScannerHooks) {}
 
   /** Mouse reporting the child has asked for, right now. */
   mouseModes(): MouseModes {
     return this.modes;
+  }
+
+  /**
+   * ?2004 — whether the child wants pasted text bracketed. Only a program that
+   * asked may be sent the markers: to everything else they are just bytes, and
+   * `cat` would print them.
+   */
+  pasteMode(): boolean {
+    return this.bracketedPaste;
   }
 
   scan(chunk: string): void {
@@ -72,6 +82,7 @@ export class OutputScanner {
       const set = m[2] === "h";
       for (const code of m[1]!.split(";")) {
         this.modes = applyMouseMode(this.modes, code, set);
+        if (code === "2004") this.bracketedPaste = set;
       }
     }
 
@@ -96,9 +107,11 @@ export class OutputScanner {
       respond("\x1b[?0u"); // kitty keyboard: no flags (graceful degrade)
     } else if (seq.endsWith("$p")) {
       const mode = m[3]!;
-      const tracked = mouseModeState(this.modes, mode);
-      // Mouse modes: report what the child actually set, since we honour them.
-      // 2026 (sync updates): recognized but off. Everything else: unknown.
+      const tracked =
+        mouseModeState(this.modes, mode) ?? (mode === "2004" ? this.bracketedPaste : null);
+      // Mouse and bracketed-paste modes: report what the child actually set,
+      // since we honour them. 2026 (sync updates): recognized but off.
+      // Everything else: unknown.
       if (tracked !== null) respond(`\x1b[?${mode};${tracked ? 1 : 2}$y`);
       else respond(mode === "2026" ? "\x1b[?2026;2$y" : `\x1b[?${mode};0$y`);
     } else if (seq.endsWith("q")) {
