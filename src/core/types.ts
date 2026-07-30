@@ -29,6 +29,11 @@ export interface SurfaceMeta {
   id: string;
   /** Title from OSC 0/2, falling back to the command name. */
   title: string;
+  /**
+   * A name the user typed (rename-tab). Wins over `title` everywhere a tab is
+   * labelled, and unlike it is never overwritten by the program's OSC titles.
+   */
+  titleOverride?: string;
   command: string;
   status: AgentStatus;
   unread: boolean;
@@ -37,6 +42,15 @@ export interface SurfaceMeta {
   /** True once the surface has ever been non-idle — it stays in the agents
    * list forever after, shown as idle between runs. */
   everActive: boolean;
+  /**
+   * The agent program the daemon's process poll can see running in this
+   * surface right now ("claude", "codex", …), or undefined for none. This is
+   * what makes an *idle* agent visible: it never printed anything, so no
+   * amount of output watching would have found it. See core/procs.ts.
+   */
+  agent?: string;
+  /** True once an agent has ever been seen here (survives it being quit). */
+  everAgent: boolean;
   exited: boolean;
   /** Last status change away from idle (drives agent list ordering). */
   lastActiveAt?: number;
@@ -61,10 +75,30 @@ export interface PaneSnapshot {
   rect: Rect;
   focused: boolean;
   surfaces: Array<
-    Pick<SurfaceMeta, "id" | "title" | "command" | "status" | "unread"> & {
+    Pick<SurfaceMeta, "id" | "title" | "command" | "status" | "unread" | "agent"> & {
       active: boolean;
     }
   >;
+}
+
+/**
+ * One agent in the profile, wherever it lives. Flat and workspace-tagged on
+ * purpose: agents are the thing you look for across a whole session, not
+ * inside one layout.
+ */
+export interface AgentSnapshot {
+  surfaceId: string;
+  title: string;
+  status: AgentStatus;
+  /** Detected agent program, or null for one only known from its activity. */
+  agent: string | null;
+  /** An agent program is running in it right now. */
+  live: boolean;
+  unread: boolean;
+  workspaceId: string;
+  workspace: string;
+  paneId: string;
+  lastActiveAt: number | null;
 }
 
 export interface WorkspaceSnapshot {
@@ -77,4 +111,6 @@ export interface WorkspaceSnapshot {
 export interface SessionSnapshot {
   session: string;
   workspaces: WorkspaceSnapshot[];
+  /** Every agent in the profile, across all workspaces. */
+  agents: AgentSnapshot[];
 }

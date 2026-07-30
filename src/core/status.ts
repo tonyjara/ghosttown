@@ -10,6 +10,12 @@ const BURST_GAP_MS = 1500;
 const DONE_QUIET_MS = 2500;
 /** Work shorter than this settles to `idle` instead of `done`. */
 const MIN_WORK_MS = 4000;
+/**
+ * Same, for a surface a known agent is running in (core/procs.ts). A short
+ * burst from a shell is a command scrolling by; from an agent it is a turn that
+ * finished, and worth flagging as `done`.
+ */
+const AGENT_MIN_WORK_MS = 1200;
 
 /**
  * Per-surface status: explicit reports (Claude Code hooks via `gt report`)
@@ -19,6 +25,8 @@ const MIN_WORK_MS = 4000;
 export class StatusTracker {
   status: AgentStatus = "idle";
   hasReporter = false;
+  /** Agent program detected in this surface right now, or null. */
+  agent: string | null = null;
 
   private lastOutputAt = 0;
   private lastInputAt = 0;
@@ -37,6 +45,11 @@ export class StatusTracker {
   report(status: AgentStatus): void {
     this.hasReporter = true;
     this.set(status);
+  }
+
+  /** What the process poll sees running here (null = no agent anymore). */
+  setAgent(agent: string | null): void {
+    this.agent = agent;
   }
 
   recordOutput(now = Date.now()): void {
@@ -61,7 +74,8 @@ export class StatusTracker {
     if (this.hasReporter || this.status !== "working") return;
     if (now - this.lastOutputAt >= DONE_QUIET_MS) {
       const workedFor = this.lastOutputAt - this.workStartAt;
-      this.set(workedFor >= MIN_WORK_MS ? "done" : "idle");
+      const minWork = this.agent ? AGENT_MIN_WORK_MS : MIN_WORK_MS;
+      this.set(workedFor >= minWork ? "done" : "idle");
     }
   }
 }

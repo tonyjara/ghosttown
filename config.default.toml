@@ -29,9 +29,9 @@ session = "main"
 restore_session = true
 
 [appearance]
-# Color theme. Built-in: ghosttown, catppuccin-mocha, catppuccin-latte,
+# Color theme. Built-in: catppuccin-mocha, catppuccin-latte, ghosttown,
 # tokyonight, gruvbox, nord, dracula.
-theme = "ghosttown"
+theme = "catppuccin-mocha"
 # Cells of spacing between panes. The gaps double as mouse drag-handles for
 # resizing. 0 = panes touch (drag-resize then needs resize mode).
 pane_gap = 1
@@ -48,15 +48,82 @@ cursor_blink = true
 
 [notifications]
 # Desktop notifications when an agent finishes or blocks in a non-visible tab.
+# Each one names the agent, the workspace it lives in and the tab's own title,
+# and carries a line of context: the hook message for a permission prompt, the
+# program's own notification text, or the last meaningful line of its screen.
 enabled = true
 # macOS notification sound name ("" for silent). E.g. Glass, Ping, Submarine.
 sound = "Glass"
+# Click a notification to jump to the agent that sent it — workspace, pane and
+# tab, with the terminal raised. This needs terminal-notifier
+# (brew install terminal-notifier); macOS's built-in osascript notifications
+# cannot carry a click action, so without it notifications still arrive, just
+# with nothing to click. Set false to keep them inert either way.
+click_focus = true
+# Which app a click brings forward, as a bundle id ("com.mitchellh.ghostty") or
+# an application name ("iTerm"). Empty = the terminal the session was started
+# from ($__CFBundleIdentifier, falling back to $TERM_PROGRAM). Set this if you
+# reattach to a session from a different terminal than you started it in.
+terminal_app = ""
+# Notifier command to run instead of the built-in ones (any platform). These
+# placeholders are substituted, shell-quoted: {title} {subtitle} {body} {sound}
+# {surface} {socket}. {focus} expands to the command that jumps to the surface —
+# run it from your own click handler. Empty = use the built-in notifiers.
+# E.g. on Linux: command = "notify-send {title} {body}"
+command = ""
 
 [sidebar]
 # Show the sidebar (profile / workspaces / agents) on startup.
 visible = true
 # Sidebar width in columns (shrinks automatically on narrow terminals).
 width = 28
+
+[agents]
+# How a tab becomes an agent. The session daemon walks the process tree of each
+# pane every poll_ms and looks for one of these commands running in it — so an
+# agent shows up in the sidebar the moment it starts, whether or not it has
+# printed anything. That is what makes an agent *waiting at its prompt* visible,
+# across every workspace in the profile, with no hooks and no configuration.
+#
+# Matching is on the program name, so "claude" covers a bare `claude`, an
+# absolute path, and a `node .../claude-code/cli.js` install. A name in an
+# argument never counts (`vim notes/claude.md` is not an agent).
+#
+# This list REPLACES the default one (that is how config arrays work here), so
+# copy it whole if you only mean to add an entry.
+commands = [
+  "claude",
+  "codex",
+  "gemini",
+  "aider",
+  "opencode",
+  "amp",
+  "cursor-agent",
+  "goose",
+  "crush",
+  "droid",
+  "copilot",
+  "qwen",
+  "cline",
+]
+# How often to look, in milliseconds. One `ps` per poll for the whole session;
+# the floor is 500.
+poll_ms = 2000
+# Set to false to turn process detection off entirely, leaving the older signals
+# (`gt report` from Claude Code hooks, and output activity) to find agents.
+detect = true
+# Also list any tab that has *been busy* — sustained output — even when nothing
+# recognizable is running in it. That was the old behavior, and it meant an nvim
+# or a shell that once ran a build stayed in the agent list forever. Turn it on
+# if you run an agent under a command name you would rather not add above.
+include_busy = false
+# The agents list is present tense: quit the agent (or /exit it) and its tab
+# leaves the list within one poll, instead of sitting there as a shell named
+# after its directory. Turn this on to keep every tab that has ever run an agent
+# listed, idle and greyed out, until you close it. (A tab that only ever reports
+# through hooks — an agent in a container, say, that no `ps` here can see — stays
+# listed either way: nothing can tell us it left.)
+keep_exited = false
 
 [keybinds]
 # The prefix chord, tmux-style. Press it twice to send it literally.
@@ -73,6 +140,9 @@ prefix = "ctrl+a"
 "next-tab" = ["n"]
 "prev-tab" = ["p"]
 "close-tab" = ["D"]
+# Name the current tab. The name sticks: it overrides the program's own title
+# and survives reloads and restarts. Save an empty name to hand it back.
+"rename-tab" = [","]
 "focus-left" = ["h", "left"]
 "focus-right" = ["l", "right"]
 "focus-up" = ["k", "up"]
@@ -81,13 +151,25 @@ prefix = "ctrl+a"
 # Resize mode: h/j/k/l (or arrows) move the pane's divider; esc/enter leave.
 "resize-mode" = ["r"]
 # Profiles are whole sessions, each with its own background daemon.
-# switch-profile lists running profiles; new-profile asks for a name and
-# jumps there (the old profile keeps running detached).
+# switch-profile lists running profiles and is also where they are managed:
+# "a" adds one, "r" renames the selected one in place, "d" kills it and
+# everything inside it (after a confirm). new-profile asks for a name and
+# jumps straight there (the old profile keeps running detached).
 "switch-profile" = ["s"]
 "new-profile" = ["S"]
-# Workspaces (layouts) within a profile. Shifted to prevent accidental triggers.
+# Workspaces (layouts) within a profile. The destructive ones are shifted to
+# prevent accidental triggers.
 "new-workspace" = ["C"]
+# Shifted n/p, mirroring the unshifted next-tab / prev-tab. Wraps around.
+"next-workspace" = ["N"]
+"prev-workspace" = ["P"]
+"rename-workspace" = ["W"]
 "delete-workspace" = ["X"]
+# Fuzzy finders, telescope-style: type to filter, ↑/↓ (or ctrl+n / ctrl+p) to
+# move, enter to jump, esc to cancel. Both are scoped to the current profile —
+# find-workspace lists this profile's workspaces, find-agent its agents.
+"find-workspace" = ["w"]
+"find-agent" = ["a"]
 # Detach: all clients drop, the session keeps running in the background.
 # Reattach with plain `gt` (or `gt --session <name>`).
 "detach" = ["d"]
@@ -103,4 +185,5 @@ prefix = "ctrl+a"
 # Tabs 1-9 are always prefix+1 .. prefix+9.
 # While the sidebar is focused (reach it with focus-left from the leftmost
 # pane, or by clicking it), keys are direct (no prefix): j/k move, enter opens,
-# a adds a workspace, r renames, d deletes (workspaces confirm; agents die).
+# a adds a workspace, r renames (a workspace, or the selected agent's tab),
+# d deletes (workspaces confirm; agents die).

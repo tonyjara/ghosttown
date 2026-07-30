@@ -25,6 +25,7 @@ import {
   type HostSurfaceInfo,
 } from "../control/protocol";
 import { SocketWriter } from "../control/sockbuf";
+import { loadConfig, reloadConfig, watchConfig, type Config } from "../core/config";
 import { MOUSE_MODES_OFF, type MouseModes } from "../core/mouse";
 import {
   cwdsOf,
@@ -35,6 +36,7 @@ import {
   writeSnapshot,
   type PersistedSession,
 } from "../core/persist";
+import { DEFAULT_AGENT_COMMANDS, findAgents, readProcTable } from "../core/procs";
 import { cursorReport, OutputScanner } from "../core/queries";
 import { StatusTracker } from "../core/status";
 import type { AgentStatus } from "../core/types";
@@ -49,6 +51,10 @@ const TICK_MS = 500;
 const SAVE_DEBOUNCE_MS = 750;
 /** Continuum-style heartbeat, mostly to notice `cd`s nothing else reports. */
 const SAVE_INTERVAL_MS = 30_000;
+/** How often the process table is walked looking for agents ([agents] poll_ms). */
+const DEFAULT_AGENT_POLL_MS = 2000;
+/** A pane can churn, but a poll cheaper than this is just burning CPU. */
+const MIN_AGENT_POLL_MS = 500;
 
 export type Sender = (frame: HostServerFrame) => void;
 
@@ -114,6 +120,8 @@ interface HostedSurface {
   id: string;
   command: string;
   title: string;
+  /** Name the user gave this tab; wins over `title` in the UI. */
+  titleOverride: string | null;
   pty: IPty | null;
   tracker: StatusTracker;
   scanner: OutputScanner;
@@ -125,6 +133,11 @@ interface HostedSurface {
   rows: number;
   everActive: boolean;
   lastActiveAt: number | null;
+  /** Agent program running in here right now, per the process poll. */
+  agent: string | null;
+  agentPid: number;
+  /** True once an agent has ever been seen here; it stays listed after. */
+  everAgent: boolean;
   exited: boolean;
 }
 
@@ -133,6 +146,8 @@ export interface PtyHost {
   handle(frame: HostClientFrame, send: Sender): void;
   /** A client went away; stop streaming to it. */
   detach(send: Sender): void;
+  /** The profile was renamed: move the snapshot to the new name. */
+  setSession(session: string): void;
   /** Kill every surface and stop the timers (daemon shutdown). */
   closeAll(): void;
   /** Blocking snapshot write, for the way out. */
@@ -147,6 +162,8 @@ export interface PtyHostOpts {
 
 export function createPtyHost(opts: PtyHostOpts): PtyHost {
   const log = opts.log ?? (() => {});
+  /** Not const: a profile can be renamed under us (see setSession). */
+  let session = opts.session;
   const surfaces = new Map<string, HostedSurface>();
   /** The attached TUI, or null while it is restarting. */
   let client: Sender | null = null;
@@ -159,6 +176,13 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
   >();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let savingNow = false;
+  // The daemon reads the config too, so [agents] changes apply to a running
+  // session the same way every other setting does.
+  let config: Config = loadConfig();
+  const stopConfigWatch = watchConfig(() => {
+    config = reloadConfig();
+    restartAgentPoll();
+  });
 
   const emit = (frame: HostServerFrame): void => {
     client?.(frame);
@@ -176,11 +200,14 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
   const info = (s: HostedSurface): HostSurfaceInfo => ({
     id: s.id,
     title: s.title,
+    titleOverride: s.titleOverride,
     command: s.command,
     status: s.tracker.status,
     hasReporter: s.tracker.hasReporter,
     everActive: s.everActive,
     lastActiveAt: s.lastActiveAt,
+    agent: s.agent,
+    everAgent: s.everAgent,
     exited: s.exited,
   });
 
@@ -242,6 +269,64 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     emit({ t: "status", id: s.id, status, hasReporter: s.tracker.hasReporter });
   };
 
+  // --- agent detection ----------------------------------------------------
+
+  const agentNames = (): string[] => {
+    const configured = config.agents?.commands;
+    return Array.isArray(configured) && configured.length > 0
+      ? configured.map(String)
+      : DEFAULT_AGENT_COMMANDS;
+  };
+
+  const setAgent = (s: HostedSurface, agent: string | null, pid: number): void => {
+    if (s.agent === agent && s.agentPid === pid) return;
+    s.agent = agent;
+    s.agentPid = pid;
+    s.tracker.setAgent(agent);
+    if (agent) {
+      s.everAgent = true;
+      // An agent that has never printed anything still deserves a place in the
+      // list, so give it a timestamp to be ordered by.
+      s.lastActiveAt ??= Date.now();
+    }
+    log("agent", s.id, agent ?? "gone", pid || "");
+    emit({ t: "agent", id: s.id, agent, pid });
+  };
+
+  /**
+   * One `ps` pass for the whole session: every surface learns whether an agent
+   * is running in it, whether or not it has printed a single byte. This is what
+   * puts an idle `claude` in the sidebar — see core/procs.ts.
+   */
+  const pollAgents = async (): Promise<void> => {
+    const roots = pids();
+    if (roots.length === 0) return;
+    const table = await readProcTable();
+    if (table.size === 0) return; // ps failed; keep what we know
+    const found = findAgents(roots, table, agentNames());
+    for (const [id] of roots) {
+      const s = surfaces.get(id);
+      if (!s) continue; // closed while ps ran
+      const agent = found.get(id);
+      setAgent(s, agent?.kind ?? null, agent?.pid ?? 0);
+    }
+  };
+
+  let agentTimer: ReturnType<typeof setInterval> | null = null;
+
+  function restartAgentPoll(): void {
+    if (agentTimer) clearInterval(agentTimer);
+    const raw = Number(config.agents?.poll_ms ?? DEFAULT_AGENT_POLL_MS);
+    const every = Number.isFinite(raw) ? Math.max(MIN_AGENT_POLL_MS, Math.floor(raw)) : DEFAULT_AGENT_POLL_MS;
+    if (config.agents?.detect === false) {
+      agentTimer = null;
+      // Nothing will refresh these now, so stop claiming they are running.
+      for (const s of surfaces.values()) setAgent(s, null, 0);
+      return;
+    }
+    agentTimer = setInterval(() => void pollAgents(), every);
+  }
+
   const spawnSurface = (frame: Extract<HostClientFrame, { t: "spawn" }>): void => {
     if (surfaces.has(frame.id)) return;
     const cols = Math.max(2, frame.cols);
@@ -250,6 +335,7 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
       id: frame.id,
       command: frame.command,
       title: frame.command.split("/").pop() ?? frame.command,
+      titleOverride: null,
       pty: null,
       // Both need `s` itself in their callbacks; assigned right below.
       tracker: null as unknown as StatusTracker,
@@ -261,6 +347,9 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
       rows,
       everActive: false,
       lastActiveAt: null,
+      agent: null,
+      agentPid: 0,
+      everAgent: false,
       exited: false,
     };
     s.tracker = new StatusTracker((status) => setStatus(s, status));
@@ -321,10 +410,16 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     s.pty.onExit(({ exitCode }) => {
       s.pty = null;
       s.exited = true;
+      // Nothing is running here anymore, and the poll skips dead ptys — so say
+      // so now rather than leaving a stale agent behind.
+      setAgent(s, null, 0);
       // Kept in the map: a TUI that is mid-restart still has to hear about it.
       emit({ t: "exit", id: s.id, code: exitCode });
     });
     log("spawned surface", s.id, frame.command);
+    // `gt new-tab -- claude` should show up as an agent now, not on the next
+    // tick; a shell that has an agent typed into it is caught by the interval.
+    void pollAgents();
   };
 
   const killSurface = (id: string): void => {
@@ -342,6 +437,7 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     for (const s of surfaces.values()) s.tracker.tick();
   }, TICK_MS);
   const saveInterval = setInterval(() => void saveSnapshot(), SAVE_INTERVAL_MS);
+  restartAgentPoll();
 
   // --- frame handling -----------------------------------------------------
 
@@ -412,6 +508,14 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
         if (!changed) setStatus(s, frame.status);
         return;
       }
+      case "rename": {
+        // Held here, not in the TUI, so the name outlives a TUI restart. The
+        // program's own OSC titles keep updating s.title underneath it.
+        const s = surfaces.get(frame.id);
+        if (!s) return;
+        s.titleOverride = frame.title?.trim().slice(0, 60) || null;
+        return;
+      }
       case "cpr": {
         const pending = pendingCpr.get(frame.seq);
         if (!pending) return; // timed out; already answered from the cache
@@ -433,7 +537,7 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
         // An explicit quit is a decision: nothing to resurrect next time.
         persist = false;
         layout = null;
-        deleteSnapshot(opts.session);
+        deleteSnapshot(session);
         for (const id of [...surfaces.keys()]) killSurface(id);
         return;
     }
@@ -441,6 +545,22 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
 
   return {
     handle,
+    /**
+     * The snapshot is named after the profile, so a rename has to move it —
+     * otherwise the session would restore under a name nothing points at
+     * anymore. The in-memory layout is retagged and written back out under the
+     * new name; the old file goes.
+     */
+    setSession(next) {
+      if (!next || next === session) return;
+      log("session renamed", session, "→", next);
+      deleteSnapshot(session);
+      session = next;
+      if (layout) {
+        layout = { ...layout, session: next };
+        scheduleSave();
+      }
+    },
     detach(send) {
       if (client === send) {
         client = null;
@@ -450,6 +570,8 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     closeAll() {
       clearInterval(tick);
       clearInterval(saveInterval);
+      if (agentTimer) clearInterval(agentTimer);
+      stopConfigWatch();
       if (saveTimer) clearTimeout(saveTimer);
       for (const { timer } of pendingCpr.values()) clearTimeout(timer);
       pendingCpr.clear();

@@ -7,19 +7,30 @@ import { dbg } from "../core/debug";
 import {
   closeSurface,
   focusedPaneId,
+  focusTarget,
   forceRedraw,
   newTab,
+  notifySurface,
   registry,
   reportStatus,
   selectTab,
+  setSessionName,
   snapshot,
   splitPane,
   store,
 } from "../core/state";
 import { desktopNotify } from "../core/notify";
-import { AGENT_STATUSES, socketPathFor, defaultSocketDir, type Request, type Response } from "./protocol";
+import { request } from "./client";
+import {
+  AGENT_STATUSES,
+  sanitizeSessionName,
+  socketPathFor,
+  defaultSocketDir,
+  type Request,
+  type Response,
+} from "./protocol";
 import { SocketWriter } from "./sockbuf";
-import type { AgentStatus } from "../core/types";
+import type { AgentStatus, SessionSnapshot } from "../core/types";
 
 function resolvePaneId(pane?: unknown): string {
   if (typeof pane === "string" && store.panes[pane]) return pane;
@@ -89,21 +100,71 @@ function dispatch(method: string, params: Record<string, unknown>): unknown {
       if (!sid) throw new Error("no such surface");
       const status = params.status as AgentStatus;
       if (!AGENT_STATUSES.includes(status)) throw new Error("bad status");
-      if (!reportStatus(sid, status)) throw new Error("report failed");
+      const message = typeof params.message === "string" ? params.message : undefined;
+      if (!reportStatus(sid, status, message)) throw new Error("report failed");
+      return true;
+    }
+    case "focus": {
+      const ok = focusTarget({
+        surface: typeof params.surface === "string" ? params.surface : undefined,
+        pane: typeof params.pane === "string" ? params.pane : undefined,
+        workspace: typeof params.workspace === "string" ? params.workspace : undefined,
+      });
+      if (!ok) throw new Error("no such surface, pane or workspace");
+      // The click that got here came from outside the input loop, and may have
+      // arrived while a detached client was away.
+      forceRedraw();
       return true;
     }
     case "redraw":
       forceRedraw();
       return true;
+    case "set-session": {
+      const name = sanitizeSessionName(String(params.session ?? ""));
+      if (!name) throw new Error("bad session name");
+      if (name !== store.session) adoptSessionName(name);
+      return true;
+    }
     case "notify": {
       const body = typeof params.body === "string" ? params.body : "";
-      const title = typeof params.title === "string" ? params.title : "ghosttown";
-      desktopNotify(`manual-${title}`, title, body);
+      const title = typeof params.title === "string" ? params.title : undefined;
+      // Sent from a surface (the usual case: a script in a pane), so it gets
+      // the same context and the same click-to-jump as an agent's own.
+      const sid = resolveSurfaceId(params.surface);
+      if (sid) notifySurface(sid, "custom", { title, body });
+      else desktopNotify({ key: `manual-${title ?? ""}`, title: title ?? "ghosttown", body });
       return true;
     }
     default:
       throw new Error(`unknown method: ${method}`);
   }
+}
+
+/**
+ * The daemon renamed this profile (see attach/daemon.ts). Start listening on
+ * the new name's control socket so `gt --session <new>` reaches us, and *keep*
+ * the old listener: every surface spawned before the rename has the old path
+ * in its GHOSTTOWN_SOCKET, and `gt report` from an agent in one of them has to
+ * keep working. Both paths lead here; only the new one is handed to surfaces
+ * spawned from now on.
+ */
+function adoptSessionName(name: string): void {
+  const path = socketPathFor(name);
+  let listening = false;
+  for (const attempt of [0, 1]) {
+    try {
+      // Second pass: a leftover file from a session that used this name before.
+      if (attempt === 1 && existsSync(path)) unlinkSync(path);
+      startControlServer(path);
+      listening = true;
+      break;
+    } catch (err) {
+      dbg("set-session: cannot listen on", path, err as Error);
+    }
+  }
+  // Without a listener the name still changes (it is the daemon's now), but
+  // new surfaces keep the socket we can actually be reached on.
+  setSessionName(name, listening ? path : undefined);
 }
 
 /**
@@ -125,38 +186,31 @@ export async function prepareSocketPath(session: string, tries = 4): Promise<str
   }
 }
 
+/** Which session answers on this control socket, or null if nothing does. */
+async function sessionAtSocket(path: string): Promise<string | null> {
+  try {
+    const snap = (await request(path, "list", {}, 1500)) as SessionSnapshot;
+    return typeof snap?.session === "string" ? snap.session : null;
+  } catch {
+    return null; // dead file, or nobody listening
+  }
+}
+
 async function claimSocketPath(session: string): Promise<string> {
   const dir = defaultSocketDir();
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = socketPathFor(session);
   if (existsSync(path)) {
-    const alive = await new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => resolve(false), 300);
-      Bun.connect({
-        unix: path,
-        socket: {
-          open(s) {
-            clearTimeout(timer);
-            s.end();
-            resolve(true);
-          },
-          data() {},
-          error() {
-            clearTimeout(timer);
-            resolve(false);
-          },
-          close() {},
-        },
-      }).catch(() => {
-        clearTimeout(timer);
-        resolve(false);
-      });
-    });
-    if (alive) {
+    const owner = await sessionAtSocket(path);
+    // A live socket answering to a *different* name is a renamed profile still
+    // serving the surfaces it spawned under this one (see adoptSessionName).
+    // The name belongs to us now; its own new path is where it lives.
+    if (owner === session) {
       throw new Error(
         `session "${session}" is already running (${path}). Use --session <name> for a second one.`,
       );
     }
+    if (owner) dbg("taking over socket left by renamed session", owner, path);
     unlinkSync(path);
   }
   return path;

@@ -12,12 +12,13 @@
  * Deliberately lean: no solid/opentui imports — the TUI child does the UI.
  */
 import { spawn, type IPty } from "bun-pty";
-import { appendFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
   attachSocketPathFor,
   defaultSocketDir,
   hostSocketPathFor,
+  sanitizeSessionName,
   socketPathFor,
   RELOAD_EXIT_CODE,
   type AttachClientFrame,
@@ -92,11 +93,14 @@ async function socketAlive(path: string): Promise<boolean> {
 
 export async function runDaemon(opts: DaemonOpts): Promise<void> {
   const entry = join(import.meta.dir, "..", "index.ts");
-  const attachPath = attachSocketPathFor(opts.session);
+  // The session name is the daemon's identity: it names every socket and the
+  // snapshot. A rename moves all of them, so none of this is const.
+  let session = opts.session;
+  let attachPath = attachSocketPathFor(session);
   mkdirSync(defaultSocketDir(), { recursive: true, mode: 0o700 });
   if (existsSync(attachPath)) {
     if (await socketAlive(attachPath)) {
-      log("daemon already running for", opts.session);
+      log("daemon already running for", session);
       process.exit(1);
     }
     unlinkSync(attachPath);
@@ -107,8 +111,8 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
   let tui: IPty | null = null;
   let shuttingDown = false;
   // Outlives every TUI in this session: the surfaces belong to it, not to the UI.
-  const host = createPtyHost({ session: opts.session, log });
-  const hostPath = listenPtyHost(host, opts.session);
+  const host = createPtyHost({ session, log });
+  let hostPath = listenPtyHost(host, session);
   const clients = new Set<Sock>();
   // DECSET/DECRST private modes the TUI has toggled (alt screen, mouse,
   // cursor…), replayed to late-attaching clients so their terminal matches.
@@ -133,13 +137,16 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
     }
   };
 
-  /** Ask the TUI (over its control socket) for a full non-diffed frame. */
-  const requestTuiRedraw = (): void => {
+  /**
+   * Fire-and-forget a control request at the TUI. `path` is explicit because a
+   * rename has to reach the TUI on the socket it is still listening on.
+   */
+  const tuiRequest = (path: string, method: string, params?: Record<string, unknown>): void => {
     Bun.connect({
-      unix: socketPathFor(opts.session),
+      unix: path,
       socket: {
         open(s) {
-          s.write(JSON.stringify({ id: 0, method: "redraw" }) + "\n");
+          s.write(JSON.stringify({ id: 0, method, params }) + "\n");
           setTimeout(() => {
             try {
               s.end();
@@ -157,6 +164,42 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
     });
   };
 
+  /**
+   * Rename this profile in place. The daemon's identity is a set of paths, so
+   * that is all a rename really is: the sockets are *moved* (an open unix socket
+   * keeps serving under its new name, and the clients' connections never
+   * notice), the host moves its snapshot, and the TUI adopts the new name over
+   * its control socket. Nothing running in the panes is touched.
+   *
+   * The TUI keeps listening on its old control socket as well — surfaces
+   * spawned before the rename carry that path in their environment, and their
+   * `gt` calls have to keep working. See control/server.ts.
+   */
+  const renameSession = (raw: string): void => {
+    const next = sanitizeSessionName(String(raw ?? ""));
+    if (!next || next === session) return;
+    const nextAttach = attachSocketPathFor(next);
+    if (existsSync(nextAttach)) {
+      log("rename refused: profile already exists", next);
+      return;
+    }
+    const nextHost = hostSocketPathFor(next);
+    try {
+      renameSync(attachPath, nextAttach);
+      renameSync(hostPath, nextHost);
+    } catch (err) {
+      log("rename failed", err as Error);
+      return;
+    }
+    const prev = session;
+    session = next;
+    attachPath = nextAttach;
+    hostPath = nextHost;
+    host.setSession(next);
+    tuiRequest(socketPathFor(prev), "set-session", { session: next });
+    log("renamed", prev, "→", next);
+  };
+
   const shutdown = (reason: "exit" | "killed"): void => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -165,7 +208,7 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
     // start. The TUI does the same on prefix+Q, but a killed TUI never gets
     // to run its handler — and a daemon *crash* must leave the snapshot
     // alone, which is exactly why this lives here and not in the signal path.
-    if (reason === "killed") deleteSnapshot(opts.session);
+    if (reason === "killed") deleteSnapshot(session);
     // A TUI that exited on its own may have moved things since the last
     // 30s heartbeat; catch up before the pids are gone.
     else host.flushSnapshotSync();
@@ -184,7 +227,9 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
       } catch {
         // already dead
       }
-      for (const path of [attachPath, hostPath]) {
+      // The TUI's control socket goes too: it is dead as of now, and leaving
+      // the file behind makes the name look taken to whoever reuses it.
+      for (const path of [attachPath, hostPath, socketPathFor(session)]) {
         try {
           unlinkSync(path);
         } catch {
@@ -204,7 +249,7 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
     // host's, so a reload costs a repaint and nothing else — this is the whole
     // point of moving them out of the TUI.
     if (process.env.GHOSTTOWN_DEV === "1") args.push("--watch");
-    args.push(entry, "__tui", "--session", opts.session);
+    args.push(entry, "__tui", "--session", session);
     if (opts.command) args.push("--", opts.command, ...(opts.args ?? []));
     log("spawning tui", { cols, rows, args });
     tui = spawn(process.execPath, args, {
@@ -277,7 +322,7 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
             } catch {
               // tui may be mid-respawn
             }
-            setTimeout(requestTuiRedraw, 150);
+            setTimeout(() => tuiRequest(socketPathFor(session), "redraw"), 150);
           } else if (frame.t === "i") {
             try {
               tui?.write(Buffer.from(String(frame.d), "base64").toString("utf8"));
@@ -315,6 +360,8 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
                   }
                 }
               }, 50);
+            } else if (frame.cmd === "rename") {
+              renameSession(frame.session);
             } else if (frame.cmd === "kill") {
               shutdown("killed");
             }

@@ -6,6 +6,7 @@ import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../core/config";
+import { activateApp, terminalApp } from "../core/notify";
 import { request } from "./client";
 import { socketPathFor } from "./protocol";
 import type { SessionSnapshot } from "../core/types";
@@ -18,15 +19,17 @@ usage:
   gt <subcommand> [options]
 
 subcommands (run from inside a session, or with GHOSTTOWN_SOCKET set):
-  list                          show panes, tabs, and agent status
+  list                          panes, tabs, and every agent in the profile
   split [-d right|down] [--pane <id>] [-- <cmd> [args...]]
   new-tab [--pane <id>] [-- <cmd> [args...]]
   select-tab <n> [--pane <id>]
   close-tab [--surface <id>]
   send-text <text> [--surface <id>]
   read-screen [--surface <id>]
-  report <idle|working|blocked|done> [--surface <id>]
-  notify <body...>
+  report <idle|working|blocked|done> [--surface <id>] [--message <text>]
+  notify <body...> [--title <text>] [--surface <id>]
+  focus [--surface <id>] [--pane <id>] [--workspace <id|name>] [--activate <app>]
+                                jump to a surface: its workspace, pane and tab
   hooks print                   show Claude Code hooks JSON
   hooks setup                   merge hooks into ~/.claude/settings.json
 `;
@@ -71,19 +74,55 @@ function parseArgs(argv: string[]): Parsed {
   return out;
 }
 
+/**
+ * Explicit flags beat the ambient environment. `GHOSTTOWN_SOCKET` is exported
+ * into every surface so an in-session `gt` needs no arguments — but a command
+ * that names its target must not be redirected to whatever session the shell
+ * running it happens to live in. (It was: `gt send-text --session other` typed
+ * into the caller's own pane instead.)
+ */
 function findSocket(flags: Record<string, string | boolean>): string {
   if (typeof flags["socket"] === "string") return flags["socket"];
+  if (typeof flags["session"] === "string") return socketPathFor(flags["session"]);
   if (process.env.GHOSTTOWN_SOCKET) return process.env.GHOSTTOWN_SOCKET;
-  const session =
-    typeof flags["session"] === "string"
-      ? flags["session"]
-      : loadConfig().general.session || "main";
-  return socketPathFor(session);
+  return socketPathFor(loadConfig().general.session || "main");
 }
 
 function surfaceParam(flags: Record<string, string | boolean>): string | undefined {
   if (typeof flags["surface"] === "string") return flags["surface"];
   return process.env.GHOSTTOWN_SURFACE_ID;
+}
+
+/**
+ * What to put in the notification this report triggers: `--message`, or the
+ * hook payload Claude Code writes to our stdin. Its Notification event carries
+ * the prompt's own message ("Claude needs your permission to run git push"),
+ * which is the whole point of a blocked notification — nothing read off the
+ * screen comes close.
+ *
+ * Only for the statuses that notify: `working` fires on every tool call and has
+ * nothing to say. Racing a timeout because a hook must never hang; a manual
+ * `gt report` has a TTY on stdin and skips this entirely.
+ */
+async function reportMessage(
+  flags: Record<string, string | boolean>,
+  status: string | undefined,
+): Promise<string | undefined> {
+  if (typeof flags["message"] === "string") return flags["message"];
+  if (status !== "blocked" && status !== "done") return undefined;
+  if (process.stdin.isTTY) return undefined;
+  try {
+    const text = await Promise.race([
+      Bun.stdin.text(),
+      new Promise<string>((r) => setTimeout(() => r(""), 250)),
+    ]);
+    if (!text.trimStart().startsWith("{")) return undefined;
+    const payload = JSON.parse(text) as { message?: unknown };
+    const message = typeof payload.message === "string" ? payload.message.trim() : "";
+    return message || undefined;
+  } catch {
+    return undefined; // not JSON, or nothing on stdin: the screen will do
+  }
 }
 
 function formatList(snap: SessionSnapshot): string {
@@ -96,8 +135,19 @@ function formatList(snap: SessionSnapshot): string {
       );
       for (const s of pane.surfaces) {
         const marks = [s.active ? "*" : " ", s.unread ? "●" : " "].join("");
-        lines.push(`      ${marks} ${s.id}  ${s.status.padEnd(7)}  ${s.title}`);
+        const agent = s.agent ? `  (${s.agent})` : "";
+        lines.push(`      ${marks} ${s.id}  ${s.status.padEnd(7)}  ${s.title}${agent}`);
       }
+    }
+  }
+  // Flat and profile-wide, so `gt list | grep blocked` is a useful thing to run.
+  if (snap.agents?.length) {
+    lines.push(`  agents (${snap.agents.length})`);
+    for (const a of snap.agents) {
+      const kind = a.agent ?? "-";
+      lines.push(
+        `    ${a.live ? "▸" : " "} ${a.surfaceId.padEnd(5)} ${a.status.padEnd(7)} ${kind.padEnd(12)} ${a.workspace}  ${a.title}`,
+      );
     }
   }
   return lines.join("\n");
@@ -208,6 +258,7 @@ export async function runCli(argv: string[]): Promise<void> {
           await request(socket, "report", {
             surface: surfaceParam(parsed.flags),
             status,
+            message: await reportMessage(parsed.flags, status),
           });
         } catch {
           return; // never break a hook
@@ -215,8 +266,37 @@ export async function runCli(argv: string[]): Promise<void> {
         return;
       }
       case "notify":
-        await request(socket, "notify", { body: parsed.positional.join(" ") });
+        await request(socket, "notify", {
+          body: parsed.positional.join(" "),
+          title: typeof parsed.flags["title"] === "string" ? parsed.flags["title"] : undefined,
+          surface: surfaceParam(parsed.flags),
+        });
         return;
+      case "focus": {
+        const pane = parsed.flags["pane"];
+        const workspace = parsed.flags["workspace"];
+        // Nothing named: the caller's own surface, which is what a script in a
+        // background tab wants when it needs the user to look at it.
+        const surface =
+          typeof parsed.flags["surface"] === "string" || (!pane && !workspace)
+            ? surfaceParam(parsed.flags)
+            : undefined;
+        await request(socket, "focus", {
+          surface,
+          pane: typeof pane === "string" ? pane : undefined,
+          workspace: typeof workspace === "string" ? workspace : undefined,
+        });
+        // Focus first, then raise the window: whatever comes forward is already
+        // showing the right pane. --activate names the app because a notifier's
+        // click handler has no environment worth reading.
+        const app = parsed.flags["activate"];
+        if (typeof app === "string") await activateApp(app);
+        else if (app === true) {
+          const resolved = terminalApp(loadConfig().notifications);
+          if (resolved) await activateApp(resolved);
+        }
+        return;
+      }
       case "hooks": {
         const action = parsed.positional[0] ?? "print";
         if (action === "setup") setupHooks();
@@ -247,5 +327,6 @@ export const CLI_SUBCOMMANDS = new Set([
   "read-screen",
   "report",
   "notify",
+  "focus",
   "hooks",
 ]);

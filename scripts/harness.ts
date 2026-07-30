@@ -5,10 +5,17 @@
  */
 import { spawn } from "bun-pty";
 import { PersistentTerminal } from "ghostty-opentui";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { OutputScanner } from "../src/core/queries";
-import { attachSocketPathFor } from "../src/control/protocol";
+import { attachSocketPathFor, socketPathFor } from "../src/control/protocol";
 import { snapshotPath } from "../src/core/persist";
 import { join } from "node:path";
 
@@ -17,38 +24,70 @@ const ROWS = 30;
 const session = `harness-${process.pid}`;
 /** Second profile created by the prefix+S (new-profile) e2e test. */
 const sessionB = `harness-${process.pid}-b`;
+/** What profile B is renamed to by the switcher's "r" e2e test. */
+const sessionC = `harness-${process.pid}-c`;
+/** A throwaway profile, created with "a" and then deleted from the inside. */
+const sessionD = `harness-${process.pid}-d`;
 const entry = join(import.meta.dir, "..", "src", "index.ts");
 
 // A user config override, to prove custom settings win over defaults:
 // new-tab remapped from "c" to "t", and a non-default theme.
 const configDir = mkdtempSync(join(tmpdir(), "gt-harness-config-"));
 const configPath = join(configDir, "config.toml");
+// Notifications go to a file instead of the desktop: `[notifications] command`
+// replaces the built-in notifiers, so nothing pops up while the harness runs
+// and what would have been shown is there to assert on. It has to be repeated
+// in every config this run writes — a config REPLACES the shipped default.
+const notifyLog = join(configDir, "notify.log");
+const NOTIFY_TOML = `[notifications]\ncommand = 'printf "%s~%s~%s\\n" {title} {subtitle} {body} >> ${notifyLog}'\n`;
 writeFileSync(
   configPath,
-  `[appearance]\ntheme = "catppuccin-mocha"\n\n[keybinds]\n"new-tab" = ["t"]\n`,
+  `[appearance]\ntheme = "catppuccin-mocha"\n\n[keybinds]\n"new-tab" = ["t"]\n\n${NOTIFY_TOML}`,
 );
 
 // Both this process (for the snapshot-path assertions) and the children.
 process.env.GHOSTTOWN_STATE_DIR = join(configDir, "state");
+// Sockets go in a sandbox of their own, which is what makes the profile tests
+// safe: listing (and killing) profiles walks this directory, and the real one
+// holds whatever sessions the developer is running right now. Short path on
+// purpose — a unix socket path is capped at ~104 bytes.
+const socketDir = `/tmp/gt-harness-${process.pid}`;
+mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+process.env.GHOSTTOWN_SOCKET_DIR = socketDir;
 
 const attachSocket = attachSocketPathFor(session);
 const attachSocketB = attachSocketPathFor(sessionB);
+const attachSocketC = attachSocketPathFor(sessionC);
+const attachSocketD = attachSocketPathFor(sessionD);
+// Every GHOSTTOWN_* var is dropped first: running the harness from inside a
+// real ghosttown session would otherwise leak that session's GHOSTTOWN_SOCKET
+// into the children, and `gt send-text` would type into the developer's own
+// pane instead of the sandbox.
 const harnessEnv = {
   ...Object.fromEntries(
-    Object.entries(process.env).filter(([, v]) => v !== undefined) as [string, string][],
+    Object.entries(process.env).filter(
+      ([k, v]) => v !== undefined && !k.startsWith("GHOSTTOWN_"),
+    ) as [string, string][],
   ),
   SHELL: "/bin/sh",
   TERM: "xterm-256color",
-  GHOSTTOWN_NO_NOTIFY: "1",
   GHOSTTOWN_CONFIG: configPath,
   GHOSTTOWN_DAEMON_LOG: join(configDir, "daemon.log"),
   // Snapshots go in the sandbox, never the developer's ~/.local/state.
   GHOSTTOWN_STATE_DIR: join(configDir, "state"),
+  // ...and so do the sockets, so this run's profiles are the only ones any
+  // profile list (or profile *delete*) in here can see.
+  GHOSTTOWN_SOCKET_DIR: socketDir,
 };
 
 // This spawns the ATTACH CLIENT, which starts the background daemon, which
 // runs the TUI in its own pty — the harness drives the whole real chain.
 const term = new PersistentTerminal({ cols: COLS, rows: ROWS });
+// ghostty-opentui emulators start with LNM on (LF acts as CR+LF); a real
+// terminal has it off. These stand in for the developer's terminal, so they
+// have to agree with one. (Surfaces do the same — see ui/MuxTerminal.)
+const LNM_OFF = "\x1b[20l";
+term.feed(LNM_OFF);
 const pty = spawn(process.execPath, ["--conditions=browser", "run", entry, "--session", session], {
   name: "xterm-256color",
   cols: COLS,
@@ -263,6 +302,36 @@ async function main(): Promise<void> {
   text = term.getText();
   expect("tab re-created", text.includes("2:"));
 
+  const click = (col: number, row: number) => {
+    pty.write(`\x1b[<0;${col};${row}M`);
+    pty.write(`\x1b[<0;${col};${row}m`);
+  };
+
+  // --- The tab strip's "+" ------------------------------------------------
+  // It opens a tab in ITS pane on DOUBLE click; a single click only focuses
+  // the pane (otherwise every mis-aimed tab click would spawn a terminal).
+  // Both strips sit on terminal row 1; the focused pane is the right one.
+  {
+    const plusCol = (term.getText().split("\n")[0] ?? "").lastIndexOf("+") + 1;
+    expect("tab strip shows a + affordance", plusCol > 0);
+    click(plusCol, 1);
+    await sleep(700); // longer than the double-click window
+    text = term.getText();
+    expect("single click on + opens nothing", !text.includes("3:"));
+    click(plusCol, 1);
+    await sleep(80);
+    click(plusCol, 1);
+    await sleep(1500);
+    text = term.getText();
+    console.log(frame("after double-clicking +"));
+    expect("double click on + opens a tab in that pane", text.includes("3:"));
+    pty.write(PREFIX);
+    await sleep(120);
+    pty.write("D");
+    await sleep(1000);
+    expect("the + tab closes again", !term.getText().includes("3:"));
+  }
+
   // Cycle back to tab 1.
   pty.write(PREFIX);
   await sleep(120);
@@ -273,7 +342,7 @@ async function main(): Promise<void> {
   const cli = async (...args: string[]): Promise<string> => {
     const proc = Bun.spawn(
       [process.execPath, "run", entry, ...args, "--session", session],
-      { stdout: "pipe", stderr: "pipe" },
+      { stdout: "pipe", stderr: "pipe", env: harnessEnv },
     );
     const out = await new Response(proc.stdout).text();
     const err = await new Response(proc.stderr).text();
@@ -285,6 +354,56 @@ async function main(): Promise<void> {
   expect("gt list shows session", listOut.includes(`session ${session}`));
   expect("gt list shows 2 panes", (listOut.match(/pane p/g) ?? []).length === 2);
   expect("gt list shows 3 surfaces", (listOut.match(/ s\d+ /g) ?? []).length === 3);
+
+  // --- gt focus: what clicking a notification runs -------------------------
+  // A notification names the surface that sent it, and getting there means
+  // switching workspace, pane AND tab from outside the app. Focus is put back
+  // where it was afterwards, so the tests below still start where they expect.
+  const paneSurfaces = (out: string) => {
+    const panes = new Map<string, { ids: string[]; active: string; focused: boolean }>();
+    let pane: string | null = null;
+    for (const line of out.split("\n")) {
+      const p = /^\s{4}pane (p\d+)( \(focused\))?/.exec(line);
+      if (p) {
+        pane = p[1]!;
+        panes.set(pane, { ids: [], active: "", focused: !!p[2] });
+        continue;
+      }
+      const s = /^\s{6}([* ])[● ] (s\d+)/.exec(line);
+      if (s && pane) {
+        const entry = panes.get(pane)!;
+        entry.ids.push(s[2]!);
+        if (s[1] === "*") entry.active = s[2]!;
+      }
+    }
+    return panes;
+  };
+  {
+    const before = paneSurfaces(listOut);
+    const [herePane, here] = [...before].find(([, v]) => v.focused)!;
+    const [therePane, there] = [...before].find(([, v]) => !v.focused)!;
+
+    await cli("focus", "--surface", there.ids[0]!);
+    await sleep(500);
+    expect("gt focus moves to the surface's pane", !!paneSurfaces(await cli("list")).get(therePane)?.focused);
+
+    // ...and a tab that was sitting behind another one comes to the front.
+    const background = here.ids.find((id) => id !== here.active)!;
+    await cli("focus", "--surface", background);
+    await sleep(500);
+    const landed = paneSurfaces(await cli("list")).get(herePane);
+    console.log(frame("after gt focus"));
+    expect(
+      "gt focus selects the surface's tab",
+      !!landed?.focused && landed.active === background,
+    );
+    await cli("focus", "--surface", here.active);
+    await sleep(500);
+    expect(
+      "focus restored for the tests below",
+      paneSurfaces(await cli("list")).get(herePane)?.active === here.active,
+    );
+  }
 
   // --- Pane gap + resize mode ---
   const parseRects = (out: string) => {
@@ -368,19 +487,82 @@ async function main(): Promise<void> {
     working = text.includes("✳");
   }
   expect("heuristic marks working during output", working);
-  expect("sidebar lists the running agent", text.includes("running"));
+  // The sidebar lists *agents*, and a shell running a loop is not one — but the
+  // surface that reported above is, and the header tallies its status.
+  expect("sidebar header tallies the blocked agent", /AGENTS \(1\)/.test(text));
+  expect("sidebar tally shows the blocked glyph", /⚑\s*1/.test(text));
+  expect("busy shell is not listed as an agent", !/○\s*sh/.test(text));
   await sleep(6500); // loop ends + DONE_QUIET + MIN_WORK satisfied
   text = term.getText();
   console.log(frame("after heuristic done"));
   expect("heuristic marks done after quiet", text.includes("✓"));
 
-  // Typing clears done → idle; the agent must STAY in the sidebar, marked idle.
-  pty.write("\r");
-  await sleep(800);
-  text = term.getText();
-  console.log(frame("idle agent persists"));
-  expect("agent stays listed when idle", text.includes("○"));
-  expect("idle agent labeled idle", text.includes("idle"));
+  // An agent that goes idle must STAY in the sidebar, marked idle — finished
+  // work has to remain one `enter` away.
+  if (surfaceId) {
+    await cli("report", "idle", "--surface", surfaceId);
+    await sleep(800);
+    text = term.getText();
+    console.log(frame("idle agent persists"));
+    expect("agent stays listed when idle", /○\s*\S/.test(text));
+    expect("gt list still reports it as an agent", (await cli("list")).includes("agents (1)"));
+  }
+
+  // A *detected* agent, on the other hand, is listed exactly while it is running:
+  // quit it and the row goes away instead of lingering as a shell named after its
+  // directory. In a tab of its own, so the reporter surface above stays out of it.
+  {
+    // A symlink to sleep, so a real `ps` really does show "…/claude 45" under
+    // the tab's shell — the process poll is not mocked here.
+    const fakeAgent = join(configDir, "claude");
+    if (!existsSync(fakeAgent)) symlinkSync("/bin/sleep", fakeAgent);
+    pty.write(PREFIX);
+    await sleep(120);
+    pty.write("t");
+    await sleep(1200);
+    // The pid goes in a variable: a non-interactive `sh` has no job control.
+    pty.write(`${fakeAgent} 45 & AGENT=$!\r`);
+    const settle = async (re: RegExp): Promise<boolean> => {
+      for (let i = 0; i < 20; i++) {
+        await sleep(400);
+        if (re.test(term.getText())) return true;
+      }
+      return false;
+    };
+    const listed = await settle(/AGENTS \(2\)/);
+    console.log(frame("detected agent joins the list"));
+    expect("process detection lists an agent that printed nothing", listed);
+    pty.write('kill "$AGENT"\r');
+    const gone = await settle(/AGENTS \(1\)/);
+    console.log(frame("quit agent leaves the list"));
+    expect("the row goes away when the agent exits", gone);
+    // Leave the pane as it was found: the tab counts below assume two.
+    pty.write(PREFIX);
+    await sleep(120);
+    pty.write("D");
+    await sleep(1000);
+  }
+
+  // --- What a notification actually says -----------------------------------
+  // Blocking where you cannot see it is the case notifications exist for, and
+  // the point is that the card alone tells you which agent, where it lives and
+  // what it wants — `--message` carries what Claude Code's hook passes on.
+  // [notifications] command sends it to a file instead of the desktop.
+  {
+    const panes = paneSurfaces(await cli("list"));
+    const hidden = [...panes.values()].find((p) => !p.focused)!.active;
+    await cli("report", "blocked", "--surface", hidden, "--message", "may I run git push?");
+    await sleep(1000);
+    const notified = existsSync(notifyLog) ? readFileSync(notifyLog, "utf8") : "";
+    console.log(`[harness] notifications:\n${notified}`);
+    const card = notified.trim().split("\n").pop() ?? "";
+    expect("a pane you cannot see blocking notifies", card.split("~").length === 3);
+    expect("the notification names the tab and what changed", card.startsWith("sh needs input~"));
+    expect("...says which profile and workspace it is in", card.includes(`~${session} · workspace 1~`));
+    expect("...and carries the reporter's own message", card.endsWith("~may I run git push?"));
+    await cli("report", "idle", "--surface", hidden);
+    await sleep(300);
+  }
 
   // Help overlay: prefix+? opens, esc closes, input is modal meanwhile.
   pty.write(PREFIX);
@@ -391,6 +573,16 @@ async function main(): Promise<void> {
   console.log(frame("help overlay"));
   expect("help overlay lists actions", text.includes("split pane right"));
   expect("help overlay shows custom new-tab bind", /\bt\s+new tab in pane/.test(text));
+  // It must fit: the workspace/agent keys and the LAST category both visible,
+  // which is what a single overflowing column used to cut off.
+  expect(
+    "help overlay shows the workspace and agent keys",
+    text.includes("Workspaces") && text.includes("find workspace") && text.includes("Agents"),
+  );
+  expect(
+    "help overlay fits the screen (last category visible)",
+    text.includes("Other") && text.includes("send literal"),
+  );
   pty.write("zzz"); // modal: must not reach the shell
   await sleep(300);
   pty.write("\x1b"); // esc closes
@@ -466,6 +658,81 @@ async function main(): Promise<void> {
   text = term.getText();
   expect("workspace 1 reopened (both panes back)", (text.match(/1:/g) ?? []).length >= 2);
 
+  // --- Fuzzy finders (prefix+w workspaces, prefix+a agents) --------------
+  // Type to filter, enter jumps. The footer's n/total is the reliable proof
+  // that filtering happened — the names themselves also live in the sidebar.
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("w");
+  await sleep(500);
+  text = term.getText();
+  console.log(frame("workspace finder"));
+  expect("workspace finder opens", text.includes("find workspace"));
+  // Footer reads "<selected>/<total>"; the selection starts on the current one.
+  expect("workspace finder lists both workspaces", /\d\/2 ·/.test(text));
+  pty.write("agen"); // matches "agents-ws" only
+  await sleep(400);
+  text = term.getText();
+  console.log(frame("workspace finder filtered"));
+  expect("query filters the list", text.includes("1/1"));
+  pty.write("\r");
+  await sleep(800);
+  text = term.getText();
+  expect("finder switched workspace on enter", text.includes("▣ agents-ws"));
+
+  // Back to workspace 1 the same way, this time with ctrl+u clearing a
+  // no-match query first.
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("w");
+  await sleep(400);
+  pty.write("zzzz");
+  await sleep(300);
+  text = term.getText();
+  expect("no-match query says so", text.includes("no match") && text.includes("0/0"));
+  pty.write("\x15"); // ctrl+u
+  await sleep(300);
+  pty.write("space 1");
+  await sleep(300);
+  pty.write("\r");
+  await sleep(900);
+  text = term.getText();
+  console.log(frame("back in workspace 1 via the finder"));
+  expect("ctrl+u clears the query", text.includes("▣ workspace 1"));
+
+  // prefix+, renames the focused tab. The name overrides the program's own
+  // title, so it must survive the reload further down.
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write(",");
+  await sleep(500);
+  text = term.getText();
+  console.log(frame("rename tab dialog"));
+  expect("rename tab dialog opens", text.includes("rename tab"));
+  pty.write("\x15"); // ctrl+u clears the prefilled title
+  await sleep(200);
+  pty.write("renamed_tab");
+  await sleep(200);
+  pty.write("\r");
+  await sleep(600);
+  text = term.getText();
+  console.log(frame("after tab rename"));
+  expect("tab strip shows the new name", text.includes(":renamed_tab"));
+
+  // prefix+a finds agents (the surface the status heuristic ran in earlier).
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("a");
+  await sleep(500);
+  text = term.getText();
+  console.log(frame("agent finder"));
+  expect("agent finder opens", text.includes("find agent"));
+  expect("agent finder found the agent", text.includes("⏎ open") && !text.includes("no match"));
+  pty.write("\x1b"); // esc: nothing to jump to that we are not already on
+  await sleep(400);
+  text = term.getText();
+  expect("agent finder closes on esc", !text.includes("find agent"));
+
   // Delete workspace 2: sidebar → j → d → confirm dialog → y.
   pty.write(PREFIX);
   await sleep(120);
@@ -510,6 +777,24 @@ async function main(): Promise<void> {
   console.log(frame("after prefix+C"));
   expect("prefix+C creates a workspace", text.includes("WORKSPACES (2)"));
   expect("prefix+C did not open a tab", (text.match(/2:/g) ?? []).length === 0);
+
+  // prefix+N / prefix+P cycle workspaces, wrapping. The new workspace is the
+  // active one, so N wraps forward onto workspace 1 and P comes back.
+  expect("the new workspace is the active one", !text.includes("▣ workspace 1"));
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("N");
+  await sleep(600);
+  text = term.getText();
+  console.log(frame("after prefix+N"));
+  expect("prefix+N wraps to the first workspace", text.includes("▣ workspace 1"));
+  pty.write(PREFIX);
+  await sleep(120);
+  pty.write("P");
+  await sleep(600);
+  text = term.getText();
+  expect("prefix+P goes back the other way", !text.includes("▣ workspace 1"));
+
   pty.write(PREFIX);
   await sleep(120);
   pty.write("X");
@@ -521,20 +806,28 @@ async function main(): Promise<void> {
   text = term.getText();
   expect("prefix+X deleted the workspace", text.includes("WORKSPACES (1)"));
 
-  // Mouse: clicking a sidebar row moves the keys into the sidebar, so the
-  // unprefixed "a" there creates a workspace instead of reaching the shell.
+  // Mouse: clicking a workspace ROW opens it and hands the keys to its
+  // terminal. Leaving them in the sidebar turned the next letter into a
+  // sidebar command — "a" made another workspace instead of reaching the shell.
   // Sidebar rows (1-based): 1 profile, 2 header, 3 first workspace.
-  const click = (col: number, row: number) => {
-    pty.write(`\x1b[<0;${col};${row}M`);
-    pty.write(`\x1b[<0;${col};${row}m`);
-  };
   click(5, 3);
+  await sleep(600);
+  pty.write("echo click_to_shell\r");
+  await sleep(1000);
+  text = term.getText();
+  console.log(frame("after clicking a workspace row"));
+  expect("workspace click hands the keys to its terminal", text.includes("click_to_shell"));
+  expect("workspace click created nothing", text.includes("WORKSPACES (1)"));
+
+  // Clicking the sidebar's own chrome still takes the keys, which is what
+  // makes j/k/a/r/d reachable with the mouse: "a" creates workspace 2.
+  click(5, 2);
   await sleep(500);
   pty.write("a");
   await sleep(1800);
   text = term.getText();
-  console.log(frame("after sidebar click + a"));
-  expect("click moves keyboard focus into the sidebar", text.includes("WORKSPACES (2)"));
+  console.log(frame("after sidebar header click + a"));
+  expect("clicking sidebar chrome takes the keys", text.includes("WORKSPACES (2)"));
 
   // Resize: reflow to a wider grid (travels client → daemon → tui pty).
   pty.resize(120, 34);
@@ -617,7 +910,7 @@ async function main(): Promise<void> {
   // surfaces (which the pty host owns) replay into the remounted UI.
   writeFileSync(
     configPath,
-    `[appearance]\ntheme = "gruvbox"\n\n[keybinds]\n"new-tab" = ["y"]\n`,
+    `[appearance]\ntheme = "gruvbox"\n\n[keybinds]\n"new-tab" = ["y"]\n\n${NOTIFY_TOML}`,
   );
   await sleep(2000);
   text = term.getText();
@@ -642,15 +935,15 @@ async function main(): Promise<void> {
   pty.write("D");
   await sleep(1000);
 
-  // Back to workspace 1 (two panes, one of them with two tabs).
+  // Back to workspace 1 (two panes, one of them with two tabs) — one click.
   click(5, 3);
-  await sleep(500);
-  pty.write("\r");
   await sleep(1200);
   text = term.getText();
   console.log(frame("workspace 1 after reload"));
   expect("panes survive reload", (text.match(/1:/g) ?? []).length >= 2);
   expect("tabs survive reload", text.includes("2:"));
+  // The rename is held in the pty host, so a restarted TUI adopts it back.
+  expect("tab rename survives the reload", text.includes(":renamed_tab"));
 
   // Detach: type a marker, detach, reattach with a NEW client — the session
   // (and its screen contents) must survive in the background daemon.
@@ -663,6 +956,7 @@ async function main(): Promise<void> {
   expect("client exited on detach", exited);
 
   const term2 = new PersistentTerminal({ cols: 120, rows: 34 });
+  term2.feed(LNM_OFF);
   const pty2 = spawn(
     process.execPath,
     ["--conditions=browser", "run", entry, "--session", session],
@@ -709,22 +1003,135 @@ async function main(): Promise<void> {
   expect("new profile daemon socket exists", existsSync(attachSocketB));
   expect("old profile keeps running detached", existsSync(attachSocket));
 
-  // Kill profile B: prefix+Q tears down ITS tui, daemon, and this client.
+  // --- Profile management from the switcher (prefix+s): a / r / d ----------
+  // Two profiles are running now: A (detached) and B (this client's).
+  pty2.write(PREFIX);
+  await sleep(120);
+  pty2.write("s");
+  await sleep(600);
+  text3 = term2.getText();
+  console.log(frame("profile switcher", term2));
+  expect("switcher lists both profiles", text3.includes("a new · r rename · d kill"));
+
+  // "a" is the new-profile input again — no second daemon, just the dialog.
+  pty2.write("a");
+  await sleep(400);
+  expect("a opens the new-profile input", term2.getText().includes("new profile"));
+  pty2.write("\x1b"); // esc goes BACK to the switcher, not away
+  await sleep(400);
+  text3 = term2.getText();
+  expect("esc returns to the switcher", text3.includes("d kill") && !text3.includes("new profile"));
+
+  // "r" renames the selected profile — B, the one we are in — in place. The
+  // panes are untouched: the daemon just moves its sockets and snapshot.
+  pty2.write("r");
+  await sleep(500);
+  console.log(frame("rename profile dialog", term2));
+  expect("rename dialog opens prefilled", term2.getText().includes(sessionB.slice(0, 16)));
+  pty2.write("\x15"); // ctrl+u
+  await sleep(200);
+  pty2.write(sessionC);
+  await sleep(200);
+  pty2.write("\r");
+  let renamed = false;
+  for (let i = 0; i < 20 && !renamed; i++) {
+    await sleep(400);
+    renamed = existsSync(attachSocketC) && term2.getText().includes(sessionC.slice(0, 18));
+  }
+  console.log(frame("after profile rename", term2));
+  expect("rename moved the daemon socket", renamed);
+  expect("old profile name is gone", !existsSync(attachSocketB));
+  // The rename is a real one: the control socket under the NEW name reaches
+  // this same session. (--socket, because cli() always names session A.)
+  const listC = await cli("list", "--socket", socketPathFor(sessionC));
+  expect("gt reaches the profile under its new name", listC.includes(`session ${sessionC}`));
+  // The snapshot follows the name, so a restore lands in the right profile.
+  let snapshotMoved = false;
+  for (let i = 0; i < 12 && !snapshotMoved; i++) {
+    await sleep(400);
+    snapshotMoved = existsSync(snapshotPath(sessionC)) && !existsSync(snapshotPath(sessionB));
+  }
+  expect("session snapshot follows the rename", snapshotMoved);
+
+  // "d" kills the OTHER profile (A, detached) with everything inside it.
+  expect("detached profile A still has a snapshot", existsSync(snapshotPath(session)));
+  pty2.write(PREFIX);
+  await sleep(120);
+  pty2.write("s");
+  await sleep(500);
+  // Profiles are listed sorted, so A ("…-<pid>") sits above C ("…-<pid>-c").
+  pty2.write("k");
+  await sleep(200);
+  pty2.write("d");
+  await sleep(500);
+  text3 = term2.getText();
+  console.log(frame("delete profile confirm", term2));
+  expect(
+    "delete asks before killing a profile",
+    text3.includes(`Kill "${session}"`) && text3.includes("stopped for good"),
+  );
+  pty2.write("y");
+  let killedA = false;
+  for (let i = 0; i < 20 && !killedA; i++) {
+    await sleep(400);
+    killedA = !existsSync(attachSocket) && !existsSync(snapshotPath(session));
+  }
+  console.log(frame("after deleting the other profile", term2));
+  expect("delete killed profile A's daemon and snapshot", killedA);
+  expect("this client stayed in its own profile", !exited2);
+
+  // Killing the profile you are IN has to move the client somewhere first —
+  // otherwise "delete this profile" would drop you out of ghosttown. Make a
+  // second one with "a", jump there, and delete it from the inside.
+  pty2.write("a");
+  await sleep(400);
+  pty2.write(sessionD);
+  await sleep(200);
+  pty2.write("\r");
+  let inD = false;
+  for (let i = 0; i < 24 && !inD; i++) {
+    await sleep(500);
+    text3 = term2.getText();
+    inD = text3.includes(sessionD.slice(0, 18)) && text3.includes("WORKSPACES");
+  }
+  console.log(frame("in the profile about to delete itself", term2));
+  expect("a created and switched to another profile", inD && existsSync(attachSocketD));
+  pty2.write(PREFIX);
+  await sleep(120);
+  pty2.write("s");
+  await sleep(500);
+  pty2.write("d"); // the switcher opens on the current profile
+  await sleep(500);
+  text3 = term2.getText();
+  console.log(frame("delete the profile we are in", term2));
+  expect(
+    "the confirm says where this client will land",
+    text3.includes(`Kill "${sessionD}"`) && text3.includes("this client moves to"),
+  );
+  pty2.write("y");
+  let backInC = false;
+  for (let i = 0; i < 24 && !backInC; i++) {
+    await sleep(500);
+    text3 = term2.getText();
+    backInC =
+      !existsSync(attachSocketD) &&
+      text3.includes(sessionC.slice(0, 18)) &&
+      text3.includes("WORKSPACES");
+  }
+  console.log(frame("landed back in the surviving profile", term2));
+  expect("deleting the current profile lands the client in another one", backInC);
+  expect("the client is still attached to something", !exited2);
+  expect("the deleted profile left no snapshot", !existsSync(snapshotPath(sessionD)));
+
+  // Kill what is left: prefix+Q tears down ITS tui, daemon, and this client.
   pty2.write(PREFIX);
   await sleep(120);
   pty2.write("Q");
   await sleep(1500);
   expect("app exited on C-a Q", exited2);
-  expect("profile B socket removed on kill", !existsSync(attachSocketB));
+  expect("profile socket removed on kill", !existsSync(attachSocketC));
   // Quitting is explicit: nothing to resurrect next time.
-  expect("profile B snapshot removed on kill", !existsSync(snapshotPath(sessionB)));
-
-  // Profile A is still running detached — kill it over its own socket.
-  expect("detached profile A still has a snapshot", existsSync(snapshotPath(session)));
-  await killDaemon();
-  await sleep(600);
-  expect("profile A socket removed on kill", !existsSync(attachSocket));
-  expect("profile A snapshot removed on kill", !existsSync(snapshotPath(session)));
+  expect("profile snapshot removed on kill", !existsSync(snapshotPath(sessionC)));
 
   if (!exited2) pty2.kill();
   console.log(failures.length === 0 ? "\n[harness] ALL PASS" : `\n[harness] FAILURES: ${failures.length}`);
@@ -733,8 +1140,9 @@ async function main(): Promise<void> {
 
 main().catch(async (err) => {
   console.error("[harness] error:", err);
-  await killDaemon();
-  await killDaemon(attachSocketB);
+  for (const socket of [attachSocket, attachSocketB, attachSocketC, attachSocketD]) {
+    await killDaemon(socket);
+  }
   if (!exited) pty.kill();
   process.exit(1);
 });

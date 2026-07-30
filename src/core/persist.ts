@@ -21,13 +21,15 @@ import { dbg } from "./debug";
 import type { LayoutNode } from "./types";
 
 /** Bumped whenever the shape below changes; older files are ignored. */
-export const SNAPSHOT_VERSION = 2;
+export const SNAPSHOT_VERSION = 3;
 
 export interface PersistedSurface {
   /** Host-side surface id — how a reloaded TUI finds the live pty again. */
   id: string;
   /** Where the shell was; null when it could not be read. */
   cwd: string | null;
+  /** The name the user gave this tab (rename-tab), if any. */
+  title?: string | null;
 }
 
 export interface PersistedPane {

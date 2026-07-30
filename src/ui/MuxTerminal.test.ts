@@ -1,9 +1,25 @@
 import { describe, expect, it } from "bun:test";
-import { clampScrollUp, viewWindow } from "./MuxTerminal";
+import { PersistentTerminal } from "ghostty-opentui";
+import { clampScrollUp, LNM_OFF, viewWindow } from "./MuxTerminal";
 
 const ROWS = 24;
 const live = (total: number, scrollUp = 0, prevTotal = total) =>
   viewWindow({ total, rows: ROWS, scrollUp, prevTotal });
+
+describe("LNM_OFF", () => {
+  it("leaves a bare LF stepping down a row without touching the column", () => {
+    // What a mux surface needs and ghostty-opentui does not ship with: `\n` is
+    // `cud1` for any full-screen app in raw mode, so a CR+LF here drags the
+    // cursor (and the app's next writes) to the left edge.
+    const term = new PersistentTerminal({ cols: 20, rows: 5 });
+    term.feed(LNM_OFF);
+    term.feed("ABC\n");
+    expect(term.getJson({ limit: 1 }).cursor).toEqual([3, 1]);
+    // CR+LF and NEL still return to column 0.
+    term.feed("\r\nX\x1bE");
+    expect(term.getJson({ limit: 1 }).cursor).toEqual([0, 3]);
+  });
+});
 
 describe("clampScrollUp", () => {
   it("stops at the oldest line in the buffer", () => {

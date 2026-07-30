@@ -12,11 +12,20 @@
  * as events; on startup it adopts whatever the host still has running.
  */
 import { createStore, produce } from "solid-js/store";
-import { readdirSync } from "node:fs";
+import { readdirSync, rmSync } from "node:fs";
 import type { HostEvents } from "../control/hostclient";
-import { defaultSocketDir, RELOAD_EXIT_CODE, type HostSurfaceInfo } from "../control/protocol";
+import {
+  attachSocketPathFor,
+  defaultSocketDir,
+  hostSocketPathFor,
+  RELOAD_EXIT_CODE,
+  sanitizeSessionName,
+  socketPathFor,
+  type HostSurfaceInfo,
+} from "../control/protocol";
 import { loadConfig, setConfigForTest } from "./config";
 import { dbg } from "./debug";
+import { fuzzyFilter } from "./fuzzy";
 import {
   collectGutters,
   collectPaneIds,
@@ -30,8 +39,8 @@ import {
   splitLeaf,
   type Gutter,
 } from "./layout";
-import { desktopNotify } from "./notify";
-import { readSnapshot, SNAPSHOT_VERSION, type PersistedSession } from "./persist";
+import { desktopNotify, notifyText, screenDetail } from "./notify";
+import { deleteSnapshot, readSnapshot, SNAPSHOT_VERSION, type PersistedSession } from "./persist";
 import { hostSend, RuntimeRegistry, SurfaceRuntime } from "./runtime";
 import type {
   AgentStatus,
@@ -49,8 +58,60 @@ export type SidebarSection = "workspaces" | "agents";
 export type DialogState =
   | { kind: "confirm-delete-workspace"; workspaceId: string }
   | { kind: "rename-workspace"; workspaceId: string; value: string }
+  | { kind: "rename-tab"; surfaceId: string; value: string }
+  /** The profile switcher, which is also where profiles are managed (a/r/d). */
   | { kind: "switch-profile"; sessions: string[]; idx: number }
-  | { kind: "new-profile"; value: string };
+  /** `back`: opened from the switcher, so cancelling returns to it. */
+  | { kind: "new-profile"; value: string; back?: boolean }
+  | { kind: "rename-profile"; session: string; value: string }
+  | { kind: "confirm-delete-profile"; session: string }
+  /** Telescope-style finders: a query filters the list as you type. */
+  | { kind: "find-workspace"; query: string; idx: number }
+  | { kind: "find-agent"; query: string; idx: number };
+
+/** Dialogs that are a single line of text being edited. */
+export type TextDialog = Extract<
+  DialogState,
+  { kind: "rename-workspace" | "rename-tab" | "new-profile" | "rename-profile" }
+>;
+
+export function isTextDialog(d: DialogState | null): d is TextDialog {
+  return (
+    d?.kind === "rename-workspace" ||
+    d?.kind === "rename-tab" ||
+    d?.kind === "new-profile" ||
+    d?.kind === "rename-profile"
+  );
+}
+
+/** A profile name lands in a filename, so those dialogs restrict what you can type. */
+const isProfileDialog = (d: DialogState | null): boolean =>
+  d?.kind === "new-profile" || d?.kind === "rename-profile";
+
+/** The dialogs that are a query + a filtered list rather than a plain input. */
+export type FinderDialog = Extract<DialogState, { kind: "find-workspace" | "find-agent" }>;
+
+export function isFinderDialog(d: DialogState | null): d is FinderDialog {
+  return d?.kind === "find-workspace" || d?.kind === "find-agent";
+}
+
+/** One row of a finder: what it is, what it looks like, where it points. */
+export interface FinderItem {
+  /** Workspace id, or surface id for the agent finder. */
+  id: string;
+  label: string;
+  /** Right-aligned detail (tab count, agent workspace + status). */
+  hint: string;
+  /** The one you are looking at right now, marked with a dot. */
+  current: boolean;
+  status?: AgentStatus;
+  /**
+   * What the query is matched against, when that is more than the label: an
+   * agent is findable by its workspace and by which agent it is, not just by
+   * whatever its tab happens to be called.
+   */
+  search?: string;
+}
 
 interface SidebarState {
   visible: boolean;
@@ -121,6 +182,27 @@ export function focusedPaneId(): string {
   return activeWorkspace()?.focusedPaneId ?? "";
 }
 
+/** What a tab is called: the user's name if they gave it one, else the title. */
+export function surfaceLabel(meta: SurfaceMeta | undefined): string {
+  return meta ? meta.titleOverride || meta.title : "";
+}
+
+/** The tab the keys are going to right now. */
+export function activeSurfaceId(): string {
+  const pane = store.panes[focusedPaneId()];
+  return pane?.surfaceIds[pane.activeIdx] ?? "";
+}
+
+/** How many tabs a workspace holds, across all its panes. */
+export function workspaceTabCount(wsId: string): number {
+  const ws = store.workspaces[wsId];
+  if (!ws?.layout) return 0;
+  return collectPaneIds(ws.layout).reduce(
+    (n, pid) => n + (store.panes[pid]?.surfaceIds.length ?? 0),
+    0,
+  );
+}
+
 export function workspaceOf(paneId: string): string | null {
   for (const wsId of store.workspaceOrder) {
     const ws = store.workspaces[wsId];
@@ -180,15 +262,129 @@ export function activeGutters(): Gutter[] {
   return collectGutters(ws.layout, paneArea(), paneGap());
 }
 
+/** An agent, plus where in the profile it lives. */
+export interface AgentEntry {
+  meta: SurfaceMeta;
+  /** Empty for a surface no pane claims (it is being closed). */
+  workspaceId: string;
+  workspace: string;
+  paneId: string;
+  /** An agent program is running in it right now (not just historically). */
+  live: boolean;
+}
+
 /**
- * Surfaces that are (or ever were) agents: reporting, non-idle now, or
- * non-idle at any point in the past. Idle agents stay listed (with an idle
- * marker) so finished work remains reachable. Most recently active first.
+ * What to call an agent in a list. Normally the tab's own label, which for a
+ * real agent is something useful ("✳ Claude Code", or whatever it renamed
+ * itself to). When the title says nothing about what is running — a bare "sh",
+ * because the agent was started by hand and sets no title — the detected
+ * program name is the more informative thing to show.
  */
-export function agentSurfaces(): SurfaceMeta[] {
+export function agentLabel(meta: SurfaceMeta): string {
+  const label = surfaceLabel(meta);
+  if (!meta.agent || meta.titleOverride) return label;
+  return label.toLowerCase().includes(meta.agent) ? label : meta.agent;
+}
+
+/** Surface id → the pane and workspace holding it, for the whole profile. */
+function surfaceHomes(): Map<string, { paneId: string; workspaceId: string }> {
+  const out = new Map<string, { paneId: string; workspaceId: string }>();
+  for (const wsId of store.workspaceOrder) {
+    const ws = store.workspaces[wsId];
+    if (!ws?.layout) continue;
+    for (const paneId of collectPaneIds(ws.layout)) {
+      for (const sid of store.panes[paneId]?.surfaceIds ?? []) {
+        out.set(sid, { paneId, workspaceId: wsId });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * What counts as an agent.
+ *
+ * Detection first: `agent` means the daemon can see an agent process in that
+ * surface *right now*, which is the only way an idle one is ever found — it
+ * prints nothing, so no output heuristic could. `hasReporter` covers anything
+ * wired up to `gt report` through hooks.
+ *
+ * The list is *present tense*. Detection is the only signal that can tell an
+ * agent has gone, so in a surface where it has ever worked (`everAgent`) its
+ * verdict is final: quit claude and the tab drops off the list instead of
+ * lingering there as a shell named after its directory. Where detection has
+ * never seen anything — an agent inside a container or over ssh, or the poll
+ * turned off — the historical signals still list the surface, because nothing
+ * else can say whether it is still there. [agents] keep_exited = true brings
+ * back the old behavior of keeping every tab that ever held an agent.
+ *
+ * Busy-but-unrecognized surfaces are *out* by default. Sustained output used to
+ * be the main signal, which meant a `nvim` or a shell that once ran a build sat
+ * in the agent list forever — noise that made the list untrustworthy in the
+ * same breath as the missing agents. [agents] include_busy brings it back.
+ */
+function isAgentSurface(m: SurfaceMeta): boolean {
+  if (m.agent) return true;
+  const cfg = loadConfig().agents;
+  const detecting = cfg?.detect !== false;
+  if (detecting && m.everAgent && cfg?.keep_exited !== true) return false;
+  if (m.everAgent || m.hasReporter) return true;
+  if (cfg?.include_busy !== true) return false;
+  return m.everActive || m.status !== "idle";
+}
+
+/**
+ * Inbox order: what needs you, then what just finished, then what is running,
+ * then what is waiting. Live agents outrank ones that have exited, and ties go
+ * to whatever was active most recently.
+ */
+const STATUS_RANK: Record<AgentStatus, number> = { blocked: 0, done: 1, working: 2, idle: 3 };
+
+function compareAgents(a: AgentEntry, b: AgentEntry): number {
+  const byStatus = STATUS_RANK[a.meta.status] - STATUS_RANK[b.meta.status];
+  if (byStatus !== 0) return byStatus;
+  if (a.live !== b.live) return a.live ? -1 : 1;
+  const byRecency = (b.meta.lastActiveAt ?? 0) - (a.meta.lastActiveAt ?? 0);
+  if (byRecency !== 0) return byRecency;
+  return a.meta.id.localeCompare(b.meta.id);
+}
+
+/**
+ * Every agent in the profile, whichever workspace it sits in, tagged with
+ * where to find it. This is the one list the sidebar, the finder and `gt list`
+ * all read from.
+ */
+export function agentEntries(): AgentEntry[] {
+  const homes = surfaceHomes();
   return Object.values(store.surfaces)
-    .filter((m) => m.hasReporter || m.everActive || m.status !== "idle")
-    .sort((a, b) => (b.lastActiveAt ?? 0) - (a.lastActiveAt ?? 0));
+    .filter(isAgentSurface)
+    .map((meta) => {
+      const home = homes.get(meta.id);
+      return {
+        meta,
+        workspaceId: home?.workspaceId ?? "",
+        workspace: home ? (store.workspaces[home.workspaceId]?.name ?? "") : "",
+        paneId: home?.paneId ?? "",
+        live: !!meta.agent,
+      };
+    })
+    .sort(compareAgents);
+}
+
+/** The same list, metadata only — what most callers want. */
+export function agentSurfaces(): SurfaceMeta[] {
+  return agentEntries().map((e) => e.meta);
+}
+
+/** Tally for the sidebar header and the status bar. */
+export function agentCounts(): Record<AgentStatus, number> & { total: number; live: number } {
+  const out = { idle: 0, working: 0, blocked: 0, done: 0, total: 0, live: 0 };
+  for (const entry of agentEntries()) {
+    out[entry.meta.status]++;
+    out.total++;
+    if (entry.live) out.live++;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +418,11 @@ function isVisibleActive(surfaceId: string): boolean {
   return false;
 }
 
-function applyStatus(surfaceId: string, status: AgentStatus): void {
+/**
+ * `silent`: the caller has already notified for this event (an OSC 9 from the
+ * program itself), so the status change must not send a second one.
+ */
+function applyStatus(surfaceId: string, status: AgentStatus, silent = false): void {
   const meta = store.surfaces[surfaceId];
   if (!meta) return;
   setStore(
@@ -239,16 +439,85 @@ function applyStatus(surfaceId: string, status: AgentStatus): void {
       }
     }),
   );
-  if (status === "done" || status === "blocked") {
-    if (!isVisibleActive(surfaceId)) {
-      const title = store.surfaces[surfaceId]?.title || "agent";
-      desktopNotify(
-        surfaceId,
-        `ghosttown · ${title}`,
-        status === "done" ? "finished working" : "needs your attention",
-      );
-    }
+  if (!silent && (status === "done" || status === "blocked") && !isVisibleActive(surfaceId)) {
+    notifySurface(surfaceId, status);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+//
+// A notification is only worth sending if it says which agent it came from and
+// what it wants — you should not have to go looking to find out whether it is
+// yours to act on. So each one carries the agent's name, where it lives, and a
+// line of its own words, plus a click that jumps straight to its tab (see
+// core/notify.ts for how the click is delivered).
+// ---------------------------------------------------------------------------
+
+/** How long a `gt report` note stays available to the status event it precedes. */
+const NOTE_TTL_MS = 15_000;
+
+/**
+ * Detail from the last `gt report` on a surface. Claude Code's Notification
+ * hook hands us the prompt's own message ("Claude needs your permission to run
+ * git push"), which is a far better notification body than anything that can be
+ * read off the screen — but it arrives on the report, one host round-trip
+ * before the status event that notifies.
+ */
+const reportNotes = new Map<string, { text: string; at: number }>();
+
+function takeReportNote(surfaceId: string): string {
+  const note = reportNotes.get(surfaceId);
+  if (!note) return "";
+  reportNotes.delete(surfaceId);
+  return Date.now() - note.at <= NOTE_TTL_MS ? note.text : "";
+}
+
+/** The workspace a surface lives in — the "where" of a notification. */
+function workspaceNameOf(surfaceId: string): string {
+  for (const pane of Object.values(store.panes)) {
+    if (!pane.surfaceIds.includes(surfaceId)) continue;
+    const wsId = workspaceOf(pane.id);
+    return wsId ? store.workspaces[wsId]!.name : "";
+  }
+  return "";
+}
+
+/**
+ * Notify for one surface. `kind` picks the headline; an explicit title/body
+ * (from `gt notify` or the program's own OSC 9) wins over the derived ones.
+ */
+export function notifySurface(
+  surfaceId: string,
+  kind: AgentStatus | "custom",
+  explicit: { title?: string; body?: string } = {},
+): void {
+  const meta = store.surfaces[surfaceId];
+  if (!meta) return;
+  const { title, subtitle } = notifyText({
+    // What to call it: the name the user gave the tab, else the agent running
+    // in it, else whatever the program calls itself.
+    label: meta.titleOverride || meta.agent || meta.title || meta.command,
+    title: meta.title,
+    workspace: workspaceNameOf(surfaceId),
+    // Which profile only matters when you run more than the usual one.
+    session: store.session === (loadConfig().general.session || "main") ? "" : store.session,
+    kind,
+    explicitTitle: explicit.title,
+  });
+
+  const fallback = kind === "blocked" ? "needs your attention" : "finished working";
+  desktopNotify({
+    key: surfaceId,
+    title,
+    subtitle,
+    body:
+      explicit.body ||
+      takeReportNote(surfaceId) ||
+      screenDetail(registry.get(surfaceId)?.screenText() ?? "") ||
+      fallback,
+    focus: { socket: socketPath, surface: surfaceId },
+  });
 }
 
 function spawnSurface(
@@ -271,6 +540,7 @@ function spawnSurface(
         unread: false,
         hasReporter: false,
         everActive: false,
+        everAgent: false,
         exited: false,
       };
     }),
@@ -302,11 +572,16 @@ function adoptSurface(info: HostSurfaceInfo): string {
       s.surfaces[info.id] = {
         id: info.id,
         title: info.title,
+        titleOverride: info.titleOverride ?? undefined,
         command: info.command,
         status: info.status,
         unread: false,
         hasReporter: info.hasReporter,
         everActive: info.everActive,
+        // The host kept detecting agents while the TUI was away, so a reload
+        // comes back with the agent list already populated.
+        agent: info.agent ?? undefined,
+        everAgent: info.everAgent,
         exited: false,
         lastActiveAt: info.lastActiveAt ?? undefined,
       };
@@ -382,6 +657,21 @@ export function hostEvents(): HostEvents {
       }
       applyStatus(id, status);
     },
+    onAgent: (id, agent) => {
+      setStore(
+        produce((s) => {
+          const m = s.surfaces[id];
+          if (!m) return;
+          m.agent = agent ?? undefined;
+          if (agent) {
+            m.everAgent = true;
+            // Ordering needs something to work with, even for an agent that has
+            // been sitting at its prompt since before we started watching.
+            m.lastActiveAt ??= Date.now();
+          }
+        }),
+      );
+    },
     onTitle: (id, title) => {
       setStore(
         produce((s) => {
@@ -390,9 +680,12 @@ export function hostEvents(): HostEvents {
         }),
       );
     },
+    // OSC 9 / OSC 777 from the program itself. It asked to be seen, so this one
+    // goes out even if its tab is on screen — and the status change that
+    // follows must not repeat it.
     onNotify: (id, title, body) => {
-      desktopNotify(id, title ? `ghosttown · ${title}` : "ghosttown", body || "notification");
-      applyStatus(id, "blocked");
+      notifySurface(id, "blocked", { title: title || undefined, body: body || undefined });
+      applyStatus(id, "blocked", true);
     },
     onModes: (id, modes) => registry.get(id)?.setMouseModes(modes),
     onCursorRequest: (id, seq) => registry.get(id)?.answerCursor(seq),
@@ -443,7 +736,11 @@ function serializeSession(): PersistedSession {
             id: paneId,
             activeIdx: pane.activeIdx,
             // cwds are filled in host-side, from the pids it owns.
-            surfaces: pane.surfaceIds.map((sid) => ({ id: sid, cwd: null })),
+            surfaces: pane.surfaceIds.map((sid) => ({
+              id: sid,
+              cwd: null,
+              title: store.surfaces[sid]?.titleOverride ?? null,
+            })),
           };
         }),
       };
@@ -545,6 +842,9 @@ function restoreSession(snap: PersistedSession, live: Map<string, HostSurfaceInf
             s.panes[pane.id]!.surfaceIds.push(surfaceId);
           }),
         );
+        // An adopted surface already has its name (the host kept it); a fresh
+        // one gets the name back from the snapshot.
+        if (!running && surface.title) renameSurface(surfaceId, surface.title);
       }
       setStore(
         produce((s) => {
@@ -593,6 +893,21 @@ export function switchWorkspace(wsId: string): void {
   const active = pane?.surfaceIds[pane.activeIdx];
   if (active) clearUnread(active);
   pushLayout();
+}
+
+/**
+ * Step to the next/previous workspace in `workspaceOrder`, wrapping around.
+ * Like the finder, this hands the keys back to the pane: cycling is something
+ * you do on your way to typing somewhere.
+ */
+export function cycleWorkspace(delta: 1 | -1): void {
+  const order = store.workspaceOrder;
+  if (order.length < 2) return;
+  const idx = order.indexOf(store.activeWorkspaceId);
+  const next = order[(((idx === -1 ? 0 : idx) + delta) % order.length + order.length) % order.length];
+  if (!next) return;
+  switchWorkspace(next);
+  blurSidebar();
 }
 
 export function renameWorkspace(wsId: string, name: string): void {
@@ -754,6 +1069,24 @@ export function newTab(paneId: string, command?: string, args?: string[]): strin
   return surfaceId;
 }
 
+/**
+ * Name a tab. The name sticks: it wins over whatever OSC titles the program
+ * sets, the pty host keeps a copy so it survives a TUI restart, and it goes in
+ * the snapshot. An empty name clears it, handing the label back to the program.
+ */
+export function renameSurface(surfaceId: string, name: string): void {
+  if (!store.surfaces[surfaceId]) return;
+  const trimmed = name.trim().slice(0, 40);
+  setStore(
+    produce((s) => {
+      const m = s.surfaces[surfaceId];
+      if (m) m.titleOverride = trimmed || undefined;
+    }),
+  );
+  registry.get(surfaceId)?.rename(trimmed || null);
+  pushLayout();
+}
+
 export function selectTab(paneId: string, idx: number): void {
   const pane = store.panes[paneId];
   if (!pane || idx < 0 || idx >= pane.surfaceIds.length) return;
@@ -820,6 +1153,38 @@ export function focusSurface(surfaceId: string): void {
   revealSurface(surfaceId, true);
 }
 
+/**
+ * `gt focus` (and what clicking a notification runs): bring a surface, pane or
+ * workspace on screen, most specific target first. A workspace may be named
+ * rather than identified, since that is what a person knows it by. Returns
+ * false when nothing matched — the tab may have been closed since.
+ */
+export function focusTarget(target: {
+  surface?: string;
+  pane?: string;
+  workspace?: string;
+}): boolean {
+  if (target.surface) {
+    if (!store.surfaces[target.surface]) return false;
+    focusSurface(target.surface);
+    return true;
+  }
+  if (target.pane) {
+    if (!store.panes[target.pane]) return false;
+    focusPane(target.pane);
+    return true;
+  }
+  if (target.workspace) {
+    const wsId = store.workspaces[target.workspace]
+      ? target.workspace
+      : store.workspaceOrder.find((id) => store.workspaces[id]!.name === target.workspace);
+    if (!wsId) return false;
+    switchWorkspace(wsId);
+    return true;
+  }
+  return false;
+}
+
 export function focusDirection(dir: "left" | "right" | "up" | "down"): void {
   if (store.sidebar.focused) {
     if (dir === "right") blurSidebar();
@@ -848,6 +1213,7 @@ function clearUnread(surfaceId: string): void {
 
 export function closeSurface(surfaceId: string): void {
   registry.remove(surfaceId);
+  reportNotes.delete(surfaceId);
   let emptyPaneId: string | null = null;
   setStore(
     produce((s) => {
@@ -963,12 +1329,19 @@ export function sidebarMove(delta: 1 | -1): void {
           sb.workspaceIdx = next;
         }
       } else {
-        const next = sb.agentIdx + delta;
-        if (next < 0) {
+        // Agents come and go under the selection — an agent quitting shortens
+        // the list — so move from where the cursor can actually be, or j/k both
+        // become no-ops on an index past the end.
+        const from = Math.min(Math.max(sb.agentIdx, 0), Math.max(0, agentCount - 1));
+        const next = from + delta;
+        if (next < 0 || agentCount === 0) {
           sb.section = "workspaces";
           sb.workspaceIdx = Math.max(0, wsCount - 1);
+          sb.agentIdx = 0;
         } else if (next < agentCount) {
           sb.agentIdx = next;
+        } else {
+          sb.agentIdx = from;
         }
       }
     }),
@@ -1003,8 +1376,11 @@ export function sidebarCreate(): void {
 }
 
 // --- Mouse ---------------------------------------------------------------
-// Clicking anywhere in the sidebar moves keyboard focus there (so j/k/a/r/d
-// work right away) and selects the row that was clicked.
+// Clicking blank sidebar space moves keyboard focus there (so j/k/a/r/d work
+// right away). Clicking a ROW is a jump, not a mode change: it acts and hands
+// the keys straight to the terminal it took you to. Keeping focus in the
+// sidebar turned the next unprefixed letter into a sidebar command — "a" after
+// clicking a workspace created another one instead of reaching the shell.
 
 export function sidebarClickWorkspace(wsId: string): void {
   const idx = store.workspaceOrder.indexOf(wsId);
@@ -1012,25 +1388,24 @@ export function sidebarClickWorkspace(wsId: string): void {
   switchWorkspace(wsId);
   setStore(
     produce((s) => {
-      s.sidebar.focused = true;
+      s.sidebar.focused = false;
       s.sidebar.section = "workspaces";
       s.sidebar.workspaceIdx = idx;
     }),
   );
 }
 
-/** Reveal the agent but keep the keys in the sidebar; enter jumps into it. */
+/** Jump into the agent's pane, the way enter does from the keyboard. */
 export function sidebarClickAgent(surfaceId: string): void {
   const idx = agentSurfaces().findIndex((m) => m.id === surfaceId);
   if (idx === -1) return;
-  revealSurface(surfaceId, false);
   setStore(
     produce((s) => {
-      s.sidebar.focused = true;
       s.sidebar.section = "agents";
       s.sidebar.agentIdx = idx;
     }),
   );
+  revealSurface(surfaceId, true);
 }
 
 export function sidebarClickProfile(): void {
@@ -1038,12 +1413,16 @@ export function sidebarClickProfile(): void {
   openSwitchProfile();
 }
 
+/** r: rename the selected workspace, or the selected agent's tab. */
 export function sidebarRename(): void {
-  if (store.sidebar.section !== "workspaces") return;
-  const wsId = store.workspaceOrder[store.sidebar.workspaceIdx];
-  const ws = wsId ? store.workspaces[wsId] : undefined;
-  if (!ws) return;
-  setStore("dialog", { kind: "rename-workspace", workspaceId: ws.id, value: ws.name });
+  const sb = store.sidebar;
+  if (sb.section === "workspaces") {
+    const wsId = store.workspaceOrder[sb.workspaceIdx];
+    if (wsId) openRenameWorkspace(wsId);
+    return;
+  }
+  const agent = agentSurfaces()[sb.agentIdx];
+  if (agent) openRenameTab(agent.id);
 }
 
 /** d: workspaces ask for confirmation; agents are killed immediately. */
@@ -1052,7 +1431,7 @@ export function sidebarDelete(): void {
   if (sb.section === "workspaces") {
     if (store.workspaceOrder.length <= 1) return;
     const wsId = store.workspaceOrder[sb.workspaceIdx];
-    if (wsId) setStore("dialog", { kind: "confirm-delete-workspace", workspaceId: wsId });
+    if (wsId) openDeleteWorkspace(wsId);
     return;
   }
   const agent = agentSurfaces()[sb.agentIdx];
@@ -1075,15 +1454,110 @@ export function sidebarDelete(): void {
 // Dialogs
 // ---------------------------------------------------------------------------
 
+/**
+ * Replace the open dialog wholesale. Through `produce`, because a plain
+ * setStore("dialog", {...}) *merges* into the object that is already there —
+ * which leaves one dialog's fields behind on the next one.
+ */
+function setDialog(d: DialogState | null): void {
+  setStore(
+    produce((s) => {
+      s.dialog = d;
+    }),
+  );
+}
+
+/** Deleting a workspace is a decision; the dialog is where it is taken. */
+export function openDeleteWorkspace(wsId: string = store.activeWorkspaceId): void {
+  if (!store.workspaces[wsId]) return;
+  setDialog({ kind: "confirm-delete-workspace", workspaceId: wsId });
+}
+
+export function openRenameWorkspace(wsId: string = store.activeWorkspaceId): void {
+  const ws = store.workspaces[wsId];
+  if (!ws) return;
+  setDialog({ kind: "rename-workspace", workspaceId: ws.id, value: ws.name });
+}
+
+export function openRenameTab(surfaceId: string = activeSurfaceId()): void {
+  const meta = store.surfaces[surfaceId];
+  if (!meta) return;
+  setDialog({ kind: "rename-tab", surfaceId, value: surfaceLabel(meta) });
+}
+
+/** Fuzzy workspace switcher. Starts on the current workspace, so ⏎ is a no-op. */
+export function openFindWorkspace(): void {
+  setDialog({
+    kind: "find-workspace",
+    query: "",
+    idx: Math.max(0, store.workspaceOrder.indexOf(store.activeWorkspaceId)),
+  });
+}
+
+/** Fuzzy agent finder, over the same list the sidebar shows. */
+export function openFindAgent(): void {
+  setDialog({ kind: "find-agent", query: "", idx: 0 });
+}
+
+function workspaceRows(): FinderItem[] {
+  return store.workspaceOrder.map((wsId) => {
+    const tabs = workspaceTabCount(wsId);
+    return {
+      id: wsId,
+      label: store.workspaces[wsId]?.name ?? "",
+      hint: `${tabs} tab${tabs === 1 ? "" : "s"}`,
+      current: wsId === store.activeWorkspaceId,
+    };
+  });
+}
+
+function agentRows(): FinderItem[] {
+  const active = activeSurfaceId();
+  return agentEntries().map((e) => {
+    const label = agentLabel(e.meta);
+    const status = e.meta.status === "working" ? "running" : e.meta.status;
+    return {
+      id: e.meta.id,
+      label,
+      // Which workspace it is in is the thing you cannot get to otherwise.
+      hint: e.workspace ? `${e.workspace} · ${status}` : status,
+      current: e.meta.id === active,
+      status: e.meta.status,
+      search: [label, e.workspace, e.meta.agent].filter(Boolean).join(" "),
+    };
+  });
+}
+
+/**
+ * Rows of the open finder, filtered by its query. Derived from the store on
+ * every read, so the list keeps up with whatever happens while it is open.
+ */
+export function finderItems(): FinderItem[] {
+  const d = store.dialog;
+  if (!isFinderDialog(d)) return [];
+  const rows = d.kind === "find-workspace" ? workspaceRows() : agentRows();
+  return fuzzyFilter(d.query, rows, (r) => r.search ?? r.label).map(({ item }) => item);
+}
+
+/** How many rows the open dialog's selection moves over. */
+function dialogRowCount(): number {
+  const d = store.dialog;
+  if (d?.kind === "switch-profile") return d.sessions.length;
+  return finderItems().length;
+}
+
 export function dialogChar(ch: string): void {
   setStore(
     produce((s) => {
-      if (s.dialog?.kind === "rename-workspace" && s.dialog.value.length < 40) {
-        s.dialog.value += ch;
-      }
-      // Profile names become socket filenames — keep them path-safe.
-      if (s.dialog?.kind === "new-profile" && s.dialog.value.length < 32 && /^[\w.-]$/.test(ch)) {
-        s.dialog.value += ch;
+      const d = s.dialog;
+      if (isProfileDialog(d) && isTextDialog(d)) {
+        // Profile names become socket filenames — keep them path-safe.
+        if (d.value.length < 32 && /^[\w.-]$/.test(ch)) d.value += ch;
+      } else if (isTextDialog(d)) {
+        if (d.value.length < 40) d.value += ch;
+      } else if (isFinderDialog(d) && d.query.length < 40) {
+        d.query += ch;
+        d.idx = 0; // a new query is a new list; start at the top of it
       }
     }),
   );
@@ -1092,42 +1566,114 @@ export function dialogChar(ch: string): void {
 export function dialogBackspace(): void {
   setStore(
     produce((s) => {
-      if (s.dialog?.kind === "rename-workspace" || s.dialog?.kind === "new-profile") {
-        s.dialog.value = s.dialog.value.slice(0, -1);
+      const d = s.dialog;
+      if (isTextDialog(d)) {
+        d.value = d.value.slice(0, -1);
+      } else if (isFinderDialog(d)) {
+        d.query = d.query.slice(0, -1);
+        d.idx = 0;
       }
     }),
   );
 }
 
-/** j/k in the switch-profile list. */
-export function dialogMove(delta: 1 | -1): void {
+/** ctrl+u: wipe the line, as in any readline prompt. */
+export function dialogClear(): void {
   setStore(
     produce((s) => {
-      if (s.dialog?.kind === "switch-profile" && s.dialog.sessions.length > 0) {
-        const n = s.dialog.sessions.length;
-        s.dialog.idx = (s.dialog.idx + delta + n) % n;
+      const d = s.dialog;
+      if (isTextDialog(d)) {
+        d.value = "";
+      } else if (isFinderDialog(d)) {
+        d.query = "";
+        d.idx = 0;
       }
     }),
   );
+}
+
+/** Move the selection in a list dialog (switch-profile, the finders). */
+export function dialogMove(delta: 1 | -1): void {
+  const count = dialogRowCount();
+  if (count === 0) return;
+  setStore(
+    produce((s) => {
+      const d = s.dialog;
+      if (d?.kind === "switch-profile" || isFinderDialog(d)) {
+        d.idx = (d.idx + delta + count) % count;
+      }
+    }),
+  );
+}
+
+/** Mouse: a click on a row selects it and takes it. */
+export function dialogPick(idx: number): void {
+  setStore(
+    produce((s) => {
+      const d = s.dialog;
+      if (d?.kind === "switch-profile" || isFinderDialog(d)) d.idx = idx;
+    }),
+  );
+  dialogConfirm();
 }
 
 export function dialogCancel(): void {
-  setStore("dialog", null);
+  const d = store.dialog;
+  // The profile dialogs are reached *from* the switcher, so esc goes back to it
+  // rather than dropping you out of what you were doing.
+  if (d?.kind === "rename-profile" || d?.kind === "confirm-delete-profile") {
+    openSwitchProfile(d.session);
+    return;
+  }
+  if (d?.kind === "new-profile" && d.back) {
+    openSwitchProfile();
+    return;
+  }
+  setDialog(null);
 }
 
 export function dialogConfirm(): void {
   const d = store.dialog;
   if (!d) return;
-  setStore("dialog", null);
-  if (d.kind === "confirm-delete-workspace") {
-    deleteWorkspace(d.workspaceId);
-  } else if (d.kind === "rename-workspace") {
-    renameWorkspace(d.workspaceId, d.value);
-  } else if (d.kind === "switch-profile") {
-    const target = d.sessions[d.idx];
-    if (target) switchProfile(target);
-  } else if (d.kind === "new-profile") {
-    switchProfile(d.value);
+  // A name that cannot be used keeps the dialog open instead of quietly
+  // throwing away what was typed. The UI says why (see Dialogs.tsx).
+  if (d.kind === "rename-profile" && !canRenameProfileTo(d.session, d.value)) return;
+  // Resolved before the dialog closes — finderItems() reads store.dialog.
+  const picked = isFinderDialog(d) ? finderItems()[d.idx] : undefined;
+  setDialog(null);
+  switch (d.kind) {
+    case "confirm-delete-workspace":
+      deleteWorkspace(d.workspaceId);
+      return;
+    case "rename-workspace":
+      renameWorkspace(d.workspaceId, d.value);
+      return;
+    case "rename-tab":
+      renameSurface(d.surfaceId, d.value);
+      return;
+    case "switch-profile": {
+      const target = d.sessions[d.idx];
+      if (target) switchProfile(target);
+      return;
+    }
+    case "new-profile":
+      switchProfile(d.value);
+      return;
+    case "rename-profile":
+      renameProfile(d.session, d.value);
+      return;
+    case "confirm-delete-profile":
+      deleteProfile(d.session);
+      return;
+    case "find-workspace":
+      if (picked) {
+        switchWorkspace(picked.id);
+        blurSidebar();
+      }
+      return;
+    case "find-agent":
+      if (picked) focusSurface(picked.id);
+      return;
   }
 }
 
@@ -1165,8 +1711,13 @@ export function setHelpVisible(visible: boolean): void {
   setStore("helpVisible", visible);
 }
 
-/** Explicit status report from `gt report` (authoritative, applied host-side). */
-export function reportStatus(surfaceId: string, status: AgentStatus): boolean {
+/**
+ * Explicit status report from `gt report` (authoritative, applied host-side).
+ * `note` is the reporter's own description of what happened — Claude Code's
+ * hook payload carries one — and becomes the body of the notification this
+ * report triggers.
+ */
+export function reportStatus(surfaceId: string, status: AgentStatus, note?: string): boolean {
   const rt = registry.get(surfaceId);
   if (!rt || !store.surfaces[surfaceId]) return false;
   setStore(
@@ -1174,6 +1725,7 @@ export function reportStatus(surfaceId: string, status: AgentStatus): boolean {
       s.surfaces[surfaceId]!.hasReporter = true;
     }),
   );
+  if (note?.trim()) reportNotes.set(surfaceId, { text: note.trim(), at: Date.now() });
   rt.report(status);
   return true;
 }
@@ -1203,6 +1755,7 @@ export function snapshot(): SessionSnapshot {
                 command: m.command,
                 status: m.status,
                 unread: m.unread,
+                agent: m.agent,
                 active: idx === pane.activeIdx,
               };
             }),
@@ -1210,6 +1763,20 @@ export function snapshot(): SessionSnapshot {
         }),
       };
     }),
+    // Flat and profile-wide: scripts (and `gt list`) should not have to walk
+    // the layout to find out what is running where.
+    agents: agentEntries().map((e) => ({
+      surfaceId: e.meta.id,
+      title: agentLabel(e.meta),
+      status: e.meta.status,
+      agent: e.meta.agent ?? null,
+      live: e.live,
+      unread: e.meta.unread,
+      workspaceId: e.workspaceId,
+      workspace: e.workspace,
+      paneId: e.paneId,
+      lastActiveAt: e.meta.lastActiveAt ?? null,
+    })),
   };
 }
 
@@ -1239,15 +1806,26 @@ export function reloadApp(): void {
   setTimeout(() => onQuit(RELOAD_EXIT_CODE), 50);
 }
 
-/** Fire-and-forget a command frame at our own attach daemon. */
-function sendDaemonCmd(frame: Record<string, unknown>): void {
-  const path = process.env.GHOSTTOWN_ATTACH_SOCKET;
-  if (!path) return; // GHOSTTOWN_NO_DAEMON: nothing to talk to
+/**
+ * Fire-and-forget command frames at a session daemon's attach socket. Frames go
+ * out in order on one connection, which is what lets a pair like
+ * switch-then-kill be sent as a single decision.
+ *
+ * `onUnreachable` runs when there is no daemon at that path — for another
+ * profile that means the socket is a leftover from a crash.
+ */
+function sendAttachCmds(
+  path: string,
+  frames: Record<string, unknown>[],
+  onUnreachable?: () => void,
+): void {
+  let delivered = false;
   Bun.connect({
     unix: path,
     socket: {
       open(s) {
-        s.write(JSON.stringify(frame) + "\n");
+        delivered = true;
+        for (const frame of frames) s.write(JSON.stringify(frame) + "\n");
         // end() mid-handler aborts the rest of the handler — defer it.
         setTimeout(() => {
           try {
@@ -1258,12 +1836,32 @@ function sendDaemonCmd(frame: Record<string, unknown>): void {
         }, 50);
       },
       data() {},
-      error() {},
+      error() {
+        if (!delivered) onUnreachable?.();
+      },
       close() {},
     },
   }).catch(() => {
-    // daemon unreachable
+    if (!delivered) onUnreachable?.();
   });
+}
+
+/**
+ * Our own daemon's attach socket. Derived from the session name rather than read
+ * from GHOSTTOWN_ATTACH_SOCKET: a rename moves the file, which would leave that
+ * variable pointing at a path the daemon no longer answers on. Its presence is
+ * still what says whether there is a daemon at all (GHOSTTOWN_NO_DAEMON).
+ */
+function ownAttachSocket(): string | null {
+  if (!process.env.GHOSTTOWN_ATTACH_SOCKET) return null;
+  return attachSocketPathFor(store.session);
+}
+
+/** Fire-and-forget a command frame at our own attach daemon. */
+function sendDaemonCmd(frame: Record<string, unknown>): void {
+  const path = ownAttachSocket();
+  if (!path) return; // GHOSTTOWN_NO_DAEMON: nothing to talk to
+  sendAttachCmds(path, [frame]);
 }
 
 /** Detach every attached client; the session keeps running in the daemon. */
@@ -1288,17 +1886,139 @@ export function listProfiles(): string[] {
   return [...names].sort();
 }
 
-export function openSwitchProfile(): void {
-  const sessions = listProfiles();
-  setStore("dialog", {
+/**
+ * The switcher, which doubles as the place profiles are managed from: a new one,
+ * a rename, a kill. `select` puts the cursor on a specific profile (coming back
+ * from one of those dialogs); `exclude` drops one that is on its way out but
+ * whose socket has not disappeared yet.
+ */
+export function openSwitchProfile(select?: string, exclude?: string): void {
+  const sessions = listProfiles().filter((name) => name !== exclude);
+  setDialog({
     kind: "switch-profile",
     sessions,
-    idx: Math.max(0, sessions.indexOf(store.session)),
+    idx: Math.max(0, sessions.indexOf(select ?? store.session)),
   });
 }
 
-export function openNewProfile(): void {
-  setStore("dialog", { kind: "new-profile", value: "" });
+/** `back`: opened with `a` from the switcher, so esc returns there. */
+export function openNewProfile(back = false): void {
+  setDialog({ kind: "new-profile", value: "", back });
+}
+
+/** The profile the switcher has selected right now, if it is open. */
+function selectedProfile(): string | null {
+  const d = store.dialog;
+  return d?.kind === "switch-profile" ? (d.sessions[d.idx] ?? null) : null;
+}
+
+export function openRenameProfile(name = selectedProfile()): void {
+  if (!name) return;
+  setDialog({ kind: "rename-profile", session: name, value: name });
+}
+
+export function openDeleteProfile(name = selectedProfile()): void {
+  if (!name) return;
+  setDialog({ kind: "confirm-delete-profile", session: name });
+}
+
+/** True when `value` is a name this profile could actually be renamed to. */
+export function canRenameProfileTo(from: string, value: string): boolean {
+  const to = sanitizeSessionName(value);
+  if (!to || to === from) return false;
+  return !listProfiles().includes(to);
+}
+
+/**
+ * Rename a profile — this one or any other running one. Its daemon owns every
+ * path the name appears in, so it does the work (see attach/daemon.ts); the
+ * new name comes back to us as a set-session control request.
+ */
+export function renameProfile(from: string, value: string): void {
+  if (!canRenameProfileTo(from, value)) return;
+  const to = sanitizeSessionName(value);
+  if (from === store.session && !ownAttachSocket()) return; // no daemon to rename
+  dbg("renameProfile", from, "→", to);
+  sendAttachCmds(attachSocketPathFor(from), [{ t: "cmd", cmd: "rename", session: to }]);
+}
+
+/**
+ * The TUI's own record of which profile it is. Called from the control server
+ * when the daemon reports a rename; `newSocketPath` is the control socket
+ * surfaces spawned from now on should be told about.
+ */
+export function setSessionName(name: string, newSocketPath?: string): void {
+  if (!name || name === store.session) return;
+  dbg("session renamed to", name);
+  if (newSocketPath) socketPath = newSocketPath;
+  setStore("session", name);
+  // The snapshot is keyed by profile name; get the new one on disk promptly.
+  pushLayoutNow();
+}
+
+/**
+ * What confirming a profile delete will do. Killing the profile you are *in*
+ * has to send this client somewhere: another running profile if there is one,
+ * and otherwise nowhere — which makes it a quit.
+ */
+export function profileDeleteTarget(name: string): { self: boolean; landsOn: string | null } {
+  if (name !== store.session) return { self: false, landsOn: null };
+  const others = listProfiles().filter((n) => n !== name);
+  return { self: true, landsOn: others[0] ?? null };
+}
+
+/**
+ * Kill a profile and everything in it: its daemon stops every surface (agents
+ * included), drops the session snapshot and removes its sockets. There is no
+ * undo — the dialog asks first.
+ */
+export function deleteProfile(name: string): void {
+  const target = sanitizeSessionName(name);
+  if (!target) return;
+  const { self, landsOn } = profileDeleteTarget(target);
+  dbg("deleteProfile", target, { self, landsOn });
+
+  if (!self) {
+    // Another profile: tell its daemon to tear itself down. A socket nothing
+    // answers on is the leftover of a crash — clean up after it ourselves.
+    sendAttachCmds(attachSocketPathFor(target), [{ t: "cmd", cmd: "kill" }], () =>
+      forgetDeadProfile(target),
+    );
+    // Its socket lingers for a moment; keep managing profiles without it.
+    openSwitchProfile(undefined, target);
+    return;
+  }
+  const own = ownAttachSocket();
+  // Nowhere to send the clients — the only profile left, or no daemon to move
+  // them with — makes this a quit, which already means "kill everything in here
+  // and do not resurrect it".
+  if (!own || !landsOn) {
+    quit();
+    return;
+  }
+  // Move the clients to the surviving profile first, then pull this one down:
+  // a kill on its own would drop the user out of ghosttown altogether.
+  sendAttachCmds(own, [
+    { t: "cmd", cmd: "switch", session: landsOn },
+    { t: "cmd", cmd: "kill" },
+  ]);
+}
+
+/** A profile whose daemon is gone: remove what it left behind. */
+function forgetDeadProfile(name: string): void {
+  dbg("deleteProfile: no daemon, cleaning up after", name);
+  for (const path of [
+    attachSocketPathFor(name),
+    hostSocketPathFor(name),
+    socketPathFor(name),
+  ]) {
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // already gone
+    }
+  }
+  deleteSnapshot(name);
 }
 
 /**
@@ -1307,7 +2027,7 @@ export function openNewProfile(): void {
  * session keeps running detached in the background.
  */
 export function switchProfile(name: string): void {
-  const target = name.trim();
+  const target = sanitizeSessionName(name);
   if (!target || target === store.session) return;
   dbg("switchProfile", target);
   sendDaemonCmd({ t: "cmd", cmd: "switch", session: target });

@@ -3,9 +3,12 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ACTION_LABELS,
   ACTIONS,
   deepMerge,
   helpRows,
+  helpLayout,
+  helpSections,
   keysForAction,
   loadConfig,
   normalizeKeySpec,
@@ -72,6 +75,11 @@ describe("loadConfig", () => {
     expect(keysForAction(config, "close-tab")).toEqual(["D"]);
     expect(keysForAction(config, "new-workspace")).toEqual(["C"]);
     expect(keysForAction(config, "delete-workspace")).toEqual(["X"]);
+    expect(keysForAction(config, "rename-workspace")).toEqual(["W"]);
+    expect(keysForAction(config, "rename-tab")).toEqual([","]);
+    // The two fuzzy finders, lowercase next to their shifted mutating pair.
+    expect(keysForAction(config, "find-workspace")).toEqual(["w"]);
+    expect(keysForAction(config, "find-agent")).toEqual(["a"]);
     expect(keysForAction(config, "detach")).toEqual(["d"]);
     expect(keysForAction(config, "reload")).toEqual(["R"]);
     expect(keysForAction(config, "quit")).toEqual(["Q"]);
@@ -113,6 +121,73 @@ describe("loadConfig", () => {
     process.env.GHOSTTOWN_CONFIG = userPath;
     const config = loadConfig();
     expect(config.keybinds.prefix).toBe("ctrl+a");
+  });
+});
+
+describe("helpSections", () => {
+  it("lists every bound action, each under a category", () => {
+    process.env.GHOSTTOWN_CONFIG = "/nonexistent/nope.toml";
+    const config = loadConfig();
+    const listed = new Set(helpSections(config).flatMap((s) => s.rows.map((r) => r.label)));
+    for (const action of ACTIONS) {
+      if (keysForAction(config, action).length === 0) continue;
+      expect(listed).toContain(ACTION_LABELS[action]);
+    }
+  });
+
+  it("gives workspaces and agents their own categories", () => {
+    process.env.GHOSTTOWN_CONFIG = "/nonexistent/nope.toml";
+    const sections = helpSections(loadConfig());
+    const workspaces = sections.find((s) => s.category === "Workspaces");
+    expect(workspaces?.rows.map((r) => r.keys)).toEqual(["C", "N", "P", "W", "X", "w"]);
+    expect(sections.some((s) => s.category === "Agents")).toBe(true);
+  });
+});
+
+describe("helpLayout", () => {
+  const layoutFor = (width: number, height: number) => {
+    process.env.GHOSTTOWN_CONFIG = "/nonexistent/nope.toml";
+    return helpLayout(loadConfig(), { width, height });
+  };
+  const contentRows = (column: { rows: unknown[] }[], spaced: boolean) =>
+    column.reduce((h, s) => h + 1 + s.rows.length, 0) + (spaced ? column.length - 1 : 0);
+
+  it("uses one spaced column when the terminal is tall enough", () => {
+    const layout = layoutFor(120, 60);
+    expect(layout.columns.length).toBe(1);
+    expect(layout.spaced).toBe(true);
+    expect(layout.height).toBeLessThanOrEqual(60 - 3);
+  });
+
+  it("splits into columns rather than clipping on a short terminal", () => {
+    const layout = layoutFor(100, 30);
+    expect(layout.columns.length).toBeGreaterThan(1);
+    for (const column of layout.columns) {
+      expect(contentRows(column, layout.spaced)).toBeLessThanOrEqual(30 - 7);
+    }
+    expect(layout.width).toBeLessThanOrEqual(100 - 4);
+    // Every category still has a home, and none is split across columns.
+    const categories = layout.columns.flat().map((s) => s.category);
+    expect(new Set(categories).size).toBe(categories.length);
+    expect(categories).toContain("Workspaces");
+    expect(categories).toContain("Agents");
+  });
+
+  it("keeps labels readable, truncating only what a column cannot hold", () => {
+    const wide = layoutFor(160, 30);
+    const narrow = layoutFor(84, 30);
+    expect(wide.labelWidth).toBeGreaterThanOrEqual(narrow.labelWidth);
+    for (const layout of [wide, narrow]) {
+      expect(layout.labelWidth).toBeGreaterThanOrEqual(14);
+      expect(layout.columnWidth).toBeGreaterThanOrEqual(layout.keyWidth + layout.labelWidth);
+    }
+  });
+
+  it("still returns a usable box on a terminal too small for everything", () => {
+    const layout = layoutFor(40, 12);
+    expect(layout.columns.flat().length).toBeGreaterThan(0);
+    expect(layout.width).toBeLessThanOrEqual(40);
+    expect(layout.height).toBeLessThanOrEqual(12 - 3);
   });
 });
 

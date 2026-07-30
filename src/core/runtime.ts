@@ -138,6 +138,12 @@ export class SurfaceRuntime {
     sendToHost({ t: "cpr", id: this.id, seq, x, y });
   }
 
+  /** Name this tab host-side, so the name survives a TUI restart. */
+  rename(title: string | null): void {
+    if (this.disposed) return;
+    sendToHost({ t: "rename", id: this.id, title });
+  }
+
   /** Explicit status report from `gt report` (authoritative, host-side). */
   report(status: AgentStatus): void {
     if (this.disposed) return;

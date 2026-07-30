@@ -1,6 +1,6 @@
 import { Show, createMemo } from "solid-js";
 import { loadConfig } from "../core/config";
-import { activeWorkspace, focusedPaneId, store } from "../core/state";
+import { activeSurfaceId, activeWorkspace, agentCounts, store, surfaceLabel } from "../core/state";
 import { theme } from "./theme";
 
 function prefixHint(): string {
@@ -11,23 +11,11 @@ function prefixHint(): string {
 }
 
 export function StatusBar() {
-  const counts = createMemo(() => {
-    let working = 0;
-    let blocked = 0;
-    let done = 0;
-    for (const m of Object.values(store.surfaces)) {
-      if (m.status === "working") working++;
-      else if (m.status === "blocked") blocked++;
-      else if (m.status === "done") done++;
-    }
-    return { working, blocked, done };
-  });
+  // Profile-wide, every workspace: the whole point of a status bar tally is
+  // that it counts what you cannot currently see.
+  const counts = createMemo(() => agentCounts());
 
-  const focusedTitle = createMemo(() => {
-    const pane = store.panes[focusedPaneId()];
-    const sid = pane?.surfaceIds[pane.activeIdx];
-    return sid ? (store.surfaces[sid]?.title ?? "") : "";
-  });
+  const focusedTitle = createMemo(() => surfaceLabel(store.surfaces[activeSurfaceId()]));
 
   return (
     <box
@@ -53,6 +41,11 @@ export function StatusBar() {
       </Show>
       <Show when={counts().done > 0}>
         <text content={` ✓ ${counts().done} `} fg={theme.done} bg={theme.statusBarBg} />
+      </Show>
+      {/* Agents waiting at their prompt: invisible until now, and the reason
+          this tally exists. */}
+      <Show when={counts().idle > 0}>
+        <text content={` ○ ${counts().idle} `} fg={theme.idle} bg={theme.statusBarBg} />
       </Show>
       <box flexGrow={1} backgroundColor={theme.statusBarBg} />
       <Show when={store.prefixArmed}>

@@ -20,6 +20,8 @@ export interface HostEvents {
   onSnapshot: (id: string, data: string) => void;
   onExit: (id: string, code: number) => void;
   onStatus: (id: string, status: AgentStatus, hasReporter: boolean) => void;
+  /** An agent program appeared in (or left) a surface; null = none anymore. */
+  onAgent: (id: string, agent: string | null) => void;
   onTitle: (id: string, title: string) => void;
   onNotify: (id: string, title: string, body: string) => void;
   onModes: (id: string, modes: MouseModes) => void;
@@ -48,6 +50,9 @@ function deliver(frame: HostServerFrame, events: HostEvents): void {
       return;
     case "status":
       events.onStatus(frame.id, frame.status, frame.hasReporter);
+      return;
+    case "agent":
+      events.onAgent(frame.id, frame.agent);
       return;
     case "title":
       events.onTitle(frame.id, frame.title);

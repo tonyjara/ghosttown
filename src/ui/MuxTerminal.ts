@@ -82,6 +82,19 @@ export function viewWindow(opts: {
  */
 let appliedCursorStyle = "";
 
+/**
+ * RM 20 (LNM off), fed to every fresh emulator.
+ *
+ * ghostty-opentui creates its terminals with LNM *on*, so a bare LF behaves
+ * like CR+LF. That is right for rendering a text blob, and wrong for a mux
+ * surface: a full-screen app in raw mode (which clears ONLCR) writes bare LF
+ * as `cud1` — "down one row, keep the column". With LNM on, every one of those
+ * slid the cursor to the left edge, and everything the app drew after it landed
+ * in the wrong columns. In neovim, walking down a list moved the cursor to
+ * column 0 and, at the bottom of the screen, parked it there.
+ */
+export const LNM_OFF = "\x1b[20l";
+
 /** How a surface reaches the program behind it for mouse reporting. */
 export interface MouseDelegate {
   modes: () => MouseModes;
@@ -92,6 +105,12 @@ export class MuxTerminal extends GhosttyTerminalRenderable {
   private scrollUp = 0;
   private prevTotal = 0;
   private mouse: MouseDelegate | null = null;
+
+  constructor(...args: ConstructorParameters<typeof GhosttyTerminalRenderable>) {
+    super(...args);
+    // Before any child bytes (including the host's replay) reach the emulator.
+    if ((this as unknown as Internals)._persistentTerminal) this.feed(LNM_OFF);
+  }
 
   /** Let this surface forward mouse events to its program (see core/mouse). */
   attachMouse(delegate: MouseDelegate): void {

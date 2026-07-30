@@ -17,18 +17,28 @@ import {
   closeActiveTab,
   createWorkspace,
   cycleTab,
+  cycleWorkspace,
   deleteWorkspace,
   dialogBackspace,
   dialogCancel,
   detachClients,
   dialogChar,
+  dialogClear,
   dialogConfirm,
   dialogMove,
   dragDivider,
   focusDirection,
   focusedPaneId,
+  isFinderDialog,
   newTab,
+  openDeleteProfile,
+  openDeleteWorkspace,
+  openFindAgent,
+  openFindWorkspace,
   openNewProfile,
+  openRenameProfile,
+  openRenameTab,
+  openRenameWorkspace,
   openSwitchProfile,
   quit,
   reloadApp,
@@ -43,7 +53,6 @@ import {
   sidebarEnter,
   sidebarMove,
   sidebarRename,
-  setStore,
   splitPane,
   store,
   toggleSidebar,
@@ -81,6 +90,9 @@ function runAction(action: Action): void {
     case "close-tab":
       closeActiveTab();
       return;
+    case "rename-tab":
+      openRenameTab();
+      return;
     case "focus-left":
       focusDirection("left");
       return;
@@ -108,13 +120,24 @@ function runAction(action: Action): void {
     case "new-workspace":
       createWorkspace();
       return;
-    case "delete-workspace": {
-      const activeWs = store.workspaces[store.activeWorkspaceId];
-      if (activeWs) {
-        setStore("dialog", { kind: "confirm-delete-workspace", workspaceId: activeWs.id });
-      }
+    case "next-workspace":
+      cycleWorkspace(1);
       return;
-    }
+    case "prev-workspace":
+      cycleWorkspace(-1);
+      return;
+    case "rename-workspace":
+      openRenameWorkspace();
+      return;
+    case "find-workspace":
+      openFindWorkspace();
+      return;
+    case "find-agent":
+      openFindAgent();
+      return;
+    case "delete-workspace":
+      openDeleteWorkspace();
+      return;
     case "detach":
       detachClients();
       return;
@@ -144,17 +167,39 @@ function handleDialogKey(key: KeyEvent): void {
     dialogConfirm();
     return;
   }
-  if (dialog.kind === "confirm-delete-workspace") {
+  if (dialog.kind === "confirm-delete-workspace" || dialog.kind === "confirm-delete-profile") {
     if (key.name === "y") dialogConfirm();
     else if (key.name === "n" || key.name === "q") dialogCancel();
     return;
   }
+  // The switcher is also where profiles are managed, on the same a/r/d as the
+  // sidebar: no query to type here, so the letters are free.
   if (dialog.kind === "switch-profile") {
     if (key.name === "j" || key.name === "down") dialogMove(1);
     else if (key.name === "k" || key.name === "up") dialogMove(-1);
+    else if (key.name === "a") openNewProfile(true);
+    else if (key.name === "r") openRenameProfile();
+    else if (key.name === "d") openDeleteProfile();
     return;
   }
-  // Text dialogs (rename-workspace, new-profile): plain editing.
+  // Finders are an input plus a list, so j/k are letters: the selection moves
+  // with the arrows or ctrl+n/ctrl+p, the way telescope and fzf do it.
+  if (isFinderDialog(dialog)) {
+    if (key.name === "down" || (key.ctrl && key.name === "n")) {
+      dialogMove(1);
+      return;
+    }
+    if (key.name === "up" || (key.ctrl && key.name === "p")) {
+      dialogMove(-1);
+      return;
+    }
+  }
+  if (key.ctrl && key.name === "u") {
+    dialogClear();
+    return;
+  }
+  // Text dialogs (rename-workspace, rename-tab, new-profile, rename-profile)
+  // and the finder query: plain editing.
   if (key.name === "backspace" || key.sequence === "\x7f") {
     dialogBackspace();
     return;

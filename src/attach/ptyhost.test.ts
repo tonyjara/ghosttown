@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPtyHost, ReplayBuffer, type Sender } from "./ptyhost";
 import type { HostClientFrame, HostServerFrame } from "../control/protocol";
+import { reloadConfig } from "../core/config";
 import { readSnapshot, SNAPSHOT_VERSION, type PersistedSession } from "../core/persist";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -82,6 +83,12 @@ describe("pty host", () => {
   beforeEach(() => {
     stateDir = mkdtempSync(join(tmpdir(), "gt-host-"));
     process.env.GHOSTTOWN_STATE_DIR = stateDir;
+    // The agent poll runs on a timer; asking for the floor keeps the tests that
+    // wait for it honest without making them slow.
+    const configPath = join(stateDir, "config.toml");
+    writeFileSync(configPath, "[agents]\npoll_ms = 500\n");
+    process.env.GHOSTTOWN_CONFIG = configPath;
+    reloadConfig();
     received = [];
     send = (frame) => received.push(frame);
     host = createPtyHost({ session: "test" });
@@ -90,6 +97,8 @@ describe("pty host", () => {
   afterEach(() => {
     host.closeAll();
     delete process.env.GHOSTTOWN_STATE_DIR;
+    delete process.env.GHOSTTOWN_CONFIG;
+    reloadConfig();
   });
 
   const spawnSh = (id: string): void => {
@@ -116,6 +125,24 @@ describe("pty host", () => {
     expect(boot.surfaces.map((s) => s.id)).toEqual(["s1"]);
     expect(boot.surfaces[0]!.command).toBe("/bin/sh");
     expect(boot.surfaces[0]!.exited).toBe(false);
+  });
+
+  it("keeps a tab's name across a TUI restart, alongside the program's title", () => {
+    feed({ t: "hello", persist: false });
+    spawnSh("s1");
+    feed({ t: "rename", id: "s1", title: "  build watcher  " });
+
+    received = [];
+    feed({ t: "hello", persist: false });
+    const named = framesOf("boot")[0]!.surfaces[0]!;
+    expect(named.titleOverride).toBe("build watcher");
+    expect(named.title).toBe("sh"); // the program's own title is untouched
+
+    // An empty rename hands the label back to the program.
+    feed({ t: "rename", id: "s1", title: null });
+    received = [];
+    feed({ t: "hello", persist: false });
+    expect(framesOf("boot")[0]!.surfaces[0]!.titleOverride).toBeNull();
   });
 
   it("runs a program and streams its output", async () => {
@@ -206,6 +233,73 @@ describe("pty host", () => {
     expect(host.surfaceCount()).toBe(1);
     feed({ t: "kill", id: "s1" });
     expect(host.surfaceCount()).toBe(0);
+  });
+
+  /** Two polls at the configured 500 ms floor, plus slack for `ps` itself. */
+  const AGENT_POLL_GRACE_MS = 1500;
+
+  /**
+   * A stand-in agent: a symlink named after a real agent pointing at `sleep`,
+   * so a real `ps` really does show `…/claude 30` running under the surface's
+   * shell. Nothing is mocked — this exercises the poll end to end.
+   */
+  const fakeAgentPath = (name: string): string => {
+    const path = join(stateDir, name);
+    symlinkSync("/bin/sleep", path);
+    return path;
+  };
+
+  it("finds an agent running in a surface, whether or not it prints anything", async () => {
+    feed({ t: "hello", persist: false });
+    spawnSh("s1");
+    // No output at all after the command: an idle agent is exactly this, and it
+    // is what the output heuristic can never see.
+    feed({ t: "w", id: "s1", d: encode(`exec ${fakeAgentPath("claude")} 30\n`) });
+
+    expect(await until(() => framesOf("agent").length > 0)).toBe(true);
+    const found = framesOf("agent")[0]!;
+    expect(found.id).toBe("s1");
+    expect(found.agent).toBe("claude");
+    expect(found.pid).toBeGreaterThan(0);
+
+    // Still idle — detection and status are separate questions.
+    received = [];
+    feed({ t: "hello", persist: false });
+    const surface = framesOf("boot")[0]!.surfaces[0]!;
+    expect(surface.agent).toBe("claude");
+    expect(surface.everAgent).toBe(true);
+    expect(surface.status).toBe("idle");
+  });
+
+  it("says so when the agent goes away, and remembers there was one", async () => {
+    feed({ t: "hello", persist: false });
+    spawnSh("s1");
+    // Keep the pid in a shell variable rather than using job control, which a
+    // non-interactive `sh` does not have.
+    feed({ t: "w", id: "s1", d: encode(`${fakeAgentPath("codex")} 30 & AGENT=$!\n`) });
+    expect(await until(() => framesOf("agent").some((f) => f.agent === "codex"))).toBe(true);
+
+    feed({ t: "w", id: "s1", d: encode('kill "$AGENT"\n') });
+    expect(await until(() => framesOf("agent").some((f) => f.agent === null))).toBe(true);
+
+    received = [];
+    feed({ t: "hello", persist: false });
+    const surface = framesOf("boot")[0]!.surfaces[0]!;
+    expect(surface.agent).toBeNull();
+    // The history survives a TUI restart; whether a quit agent is still listed
+    // is core/state's call ([agents] keep_exited), not the host's.
+    expect(surface.everAgent).toBe(true);
+  });
+
+  it("leaves a plain shell alone", async () => {
+    feed({ t: "hello", persist: false });
+    spawnSh("s1");
+    feed({ t: "w", id: "s1", d: encode("sleep 30 &\n") });
+    await sleep(AGENT_POLL_GRACE_MS);
+    expect(framesOf("agent")).toEqual([]);
+    received = [];
+    feed({ t: "hello", persist: false });
+    expect(framesOf("boot")[0]!.surfaces[0]!.everAgent).toBe(false);
   });
 
   const layout = (surfaceId: string): PersistedSession => ({

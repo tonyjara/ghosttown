@@ -1,39 +1,46 @@
 import { For, Show, createMemo } from "solid-js";
+import type { MouseEvent } from "@opentui/core";
 import {
-  agentSurfaces,
+  agentCounts,
+  agentEntries,
+  agentLabel,
   focusSidebar,
   sidebarClickAgent,
   sidebarClickProfile,
   sidebarClickWorkspace,
   sidebarWidth,
   store,
+  type AgentEntry,
 } from "../core/state";
-import type { SurfaceMeta } from "../core/types";
-import { agentGlyph, theme } from "./theme";
+import { truncate, twoColumnRow, windowStart } from "./list";
+import { agentGlyph, statusGlyph, theme } from "./theme";
 
-function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, Math.max(1, n - 1)) + "…" : s;
-}
-
-/** Keep the selected row inside a window of `visible` rows. */
-function windowStart(sel: number, count: number, visible: number): number {
-  if (count <= visible || visible <= 0) return 0;
-  return Math.max(0, Math.min(sel - visible + 1, count - visible));
-}
+/** Rows the agents half keeps even when there are many workspaces. */
+const MIN_AGENT_ROWS = 4;
 
 /**
- * Left sidebar: profile name on top, then two halves — workspaces and the
- * profile's agents (most recently done first). Focused via focus-left from
- * the leftmost pane; keys are handled in App and act on core/state.
+ * Left sidebar: profile name on top, then two halves — workspaces and every
+ * agent in the profile, whichever workspace it lives in, in inbox order
+ * (blocked, done, running, idle). Focused via focus-left from the leftmost
+ * pane; keys are handled in App and act on core/state.
+ *
+ * The agents half is the point of the sidebar, so it gets all the room the
+ * workspace list does not need.
  */
 export function Sidebar() {
   const width = () => sidebarWidth();
   const height = () => Math.max(4, store.screen.height - 1);
-  // Row 0 is the profile; the rest splits into the two halves.
-  const topH = () => Math.max(2, Math.floor((height() - 1) / 2));
+  // Row 0 is the profile. Workspaces take what they need (header + one row
+  // each); everything left over goes to the agents.
+  const topH = () => {
+    const wanted = 1 + store.workspaceOrder.length;
+    const cap = Math.max(2, height() - 1 - (MIN_AGENT_ROWS + 1));
+    return Math.max(2, Math.min(wanted, cap));
+  };
   const bottomH = () => Math.max(2, height() - 1 - topH());
 
-  const agents = createMemo(() => agentSurfaces());
+  const agents = createMemo(() => agentEntries());
+  const counts = createMemo(() => agentCounts());
 
   const wsSelected = (i: number) =>
     store.sidebar.focused && store.sidebar.section === "workspaces" && i === store.sidebar.workspaceIdx;
@@ -53,7 +60,7 @@ export function Sidebar() {
     const start = windowStart(store.sidebar.agentIdx, agents().length, agentVisibleRows());
     return agents()
       .slice(start, start + agentVisibleRows())
-      .map((m, i) => ({ m, idx: start + i }));
+      .map((e, i) => ({ e, idx: start + i }));
   });
 
   const wsRow = (idx: number, name: string, active: boolean) => {
@@ -61,12 +68,49 @@ export function Sidebar() {
     return truncate(` ${marker} ${idx + 1} ${name}`, width()).padEnd(width());
   };
 
-  const agentRow = (m: SurfaceMeta) => {
-    const glyph = agentGlyph(m.status).glyph;
-    const word = m.status === "working" ? "running" : m.status;
-    const titleRoom = Math.max(3, width() - word.length - 5);
-    const left = ` ${glyph} ${truncate(m.title, titleRoom)}`;
-    return left.padEnd(Math.max(left.length, width() - word.length - 1)) + word;
+  /**
+   * ` ✳ claude          FrontendV2` — the status is in the glyph and its color,
+   * which leaves the right-hand column for the workspace. That column is what
+   * makes the list usable across a profile: without it, five agents called
+   * "claude" are indistinguishable.
+   */
+  const agentRow = (e: AgentEntry) => {
+    // An agent sitting at its prompt (○) and one no process poll can see (·) —
+    // a reporter-only tab, or a quit agent under [agents] keep_exited — are both
+    // "idle", and the difference is worth one character.
+    const glyph = e.meta.status === "idle" && !e.live ? "·" : agentGlyph(e.meta.status).glyph;
+    const unread = e.meta.unread ? "•" : " ";
+    const ws = store.workspaceOrder.length > 1 ? truncate(e.workspace, 12) : "";
+    return twoColumnRow(` ${glyph}${unread}${agentLabel(e.meta)}`, ws ? `${ws} ` : "", width());
+  };
+
+  /**
+   * Status color while there is a status to show; otherwise brightness carries
+   * the difference between an agent waiting at its prompt and a tab whose agent
+   * is no longer running.
+   */
+  const agentRowFg = (e: AgentEntry) => {
+    if (e.meta.status !== "idle") return agentGlyph(e.meta.status).color;
+    return e.live ? theme.tabFg : theme.idle;
+  };
+
+  /** `AGENTS (5)  ⚑1 ✳2` — the tally covers the ones scrolled out of view. */
+  const agentHeader = () => {
+    const c = counts();
+    const tally = (["blocked", "working", "done"] as const)
+      .filter((s) => c[s] > 0)
+      .map((s) => `${statusGlyph(s).glyph}${c[s]}`)
+      .join(" ");
+    return twoColumnRow(` AGENTS (${c.total})`, tally ? `${tally} ` : "", width());
+  };
+
+  /**
+   * A row click acts on its own; without this it would bubble to the sidebar
+   * box, whose job is only to catch clicks on blank space and take the keys.
+   */
+  const rowClick = (act: () => void) => (e: MouseEvent) => {
+    e.stopPropagation();
+    act();
   };
 
   return (
@@ -84,10 +128,16 @@ export function Sidebar() {
         content={truncate(` ⌂ ${store.session}`, width()).padEnd(width())}
         fg={theme.accent}
         bg={store.sidebar.focused ? theme.stripBgFocused : theme.sidebarBg}
-        onMouseDown={() => sidebarClickProfile()}
+        selectable={false}
+        onMouseDown={rowClick(sidebarClickProfile)}
       />
       <box height={topH()} flexDirection="column" backgroundColor={theme.sidebarBg} flexShrink={0}>
-        <text content={` WORKSPACES (${store.workspaceOrder.length})`} fg={theme.idle} bg={theme.sidebarBg} />
+        <text
+          content={` WORKSPACES (${store.workspaceOrder.length})`}
+          fg={theme.idle}
+          bg={theme.sidebarBg}
+          selectable={false}
+        />
         <For each={wsWindow()}>
           {(entry) => {
             const ws = () => store.workspaces[entry.id];
@@ -98,7 +148,8 @@ export function Sidebar() {
                   content={wsRow(entry.idx, ws()!.name, active())}
                   fg={wsSelected(entry.idx) ? theme.tabFgActive : active() ? theme.accent : theme.tabFg}
                   bg={wsSelected(entry.idx) ? theme.sidebarSelBg : theme.sidebarBg}
-                  onMouseDown={() => sidebarClickWorkspace(entry.id)}
+                  selectable={false}
+                  onMouseDown={rowClick(() => sidebarClickWorkspace(entry.id))}
                 />
               </Show>
             );
@@ -106,18 +157,21 @@ export function Sidebar() {
         </For>
       </box>
       <box height={bottomH()} flexDirection="column" backgroundColor={theme.sidebarBg} flexShrink={0}>
-        <text content={` AGENTS (${agents().length})`} fg={theme.idle} bg={theme.sidebarBg} />
+        <text content={agentHeader()} fg={theme.idle} bg={theme.sidebarBg} selectable={false} />
         <Show
           when={agents().length > 0}
-          fallback={<text content="  (none)" fg={theme.idle} bg={theme.sidebarBg} />}
+          fallback={
+            <text content="  (none)" fg={theme.idle} bg={theme.sidebarBg} selectable={false} />
+          }
         >
           <For each={agentWindow()}>
             {(entry) => (
               <text
-                content={agentRow(entry.m)}
-                fg={agentSelected(entry.idx) ? theme.tabFgActive : agentGlyph(entry.m.status).color}
+                content={agentRow(entry.e)}
+                fg={agentSelected(entry.idx) ? theme.tabFgActive : agentRowFg(entry.e)}
                 bg={agentSelected(entry.idx) ? theme.sidebarSelBg : theme.sidebarBg}
-                onMouseDown={() => sidebarClickAgent(entry.m.id)}
+                selectable={false}
+                onMouseDown={rowClick(() => sidebarClickAgent(entry.e.meta.id))}
               />
             )}
           </For>

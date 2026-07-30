@@ -108,8 +108,12 @@ explicit signals, never guessed from text).
   activity followed by ≥2s quiet → done (one notification), brief activity →
   idle. Disabled for a surface once it has ever reported explicitly.
 - Typing into a surface clears done/blocked → idle. Focusing clears unread.
-- done/blocked on a non-visible surface → unread badge + OSC 9 host
-  notification (+ macOS notification via osascript).
+- done/blocked on a non-visible surface → unread badge + a desktop notification
+  naming the agent, its workspace and its own title, bodied with the hook
+  message / OSC 9 text / last meaningful screen line. Clicking it runs
+  `gt focus --surface <id>` (terminal-notifier `-execute`), which switches
+  workspace, pane and tab and raises the terminal; osascript is the fallback
+  when terminal-notifier is not installed, and cannot carry a click.
 
 ## MVP scope (v0.1)
 
@@ -120,7 +124,7 @@ explicit signals, never guessed from text).
 - [x] Status glyphs per tab + status bar; unread badges; desktop notifications
 - [x] Query responder (DSR 6n/5n, DA1, XTVERSION, OSC 10/11, DECRQM, kitty query → 0)
 - [x] Unix socket + `gt` CLI: list, split, new-tab, select-tab, close-tab,
-      send-text, read-screen, report, notify
+      send-text, read-screen, report, notify, focus
 - [x] `gt hooks setup` for Claude Code
 - [x] Scripted PTY harness test (app driven under bun-pty, frames snapshotted)
 - [x] TOML config: shipped defaults (`config.default.toml`) deep-merged with
@@ -137,9 +141,11 @@ explicit signals, never guessed from text).
 | `n` / `p` | next / previous tab |
 | `1`–`9` | select tab N |
 | `D` (shift+d) | close tab (pane closes with last tab) |
-| `C` / `X` (shift) | new / delete workspace |
+| `,` | rename tab (sticks over the program's title) |
+| `C` / `W` / `X` (shift) | new / rename / delete workspace |
+| `w` / `a` | find workspace / find agent (fuzzy pickers with an input) |
 | `r` | resize mode: h/j/k/l move the divider, esc leaves |
-| `s` / `S` | switch profile / new profile (sessions; old one keeps running) |
+| `s` / `S` | profiles (switch, and a/r/d to add/rename/kill) / new profile |
 | `d` | detach — session keeps running in the daemon |
 | `R` (shift+r) | reload the TUI from source (dev loop; panes keep running) |
 | `Q` (shift+q) | kill ghosttown and everything inside it |
@@ -165,6 +171,12 @@ scrollback).
   `bye reason:"switch"` and the attach client re-enters its connect loop
   against the target session, spawning that daemon if needed; the old
   session keeps running detached).
+- ~~Profile management~~ (shipped: `a` / `r` / `d` inside `prefix s`. A rename is
+  the daemon moving its own sockets and snapshot to the new name and telling its
+  TUI over `set-session` — nothing in the panes notices; the TUI keeps its old
+  control socket alive for surfaces that were spawned with it in their env. A
+  delete is that profile's daemon killing everything it owns, with the client
+  moved to a surviving profile first when it is the one being deleted).
 - ~~Session snapshots~~ (shipped: the layout — workspaces, split ratios, panes,
   tab order, per-surface id and cwd — goes to
   `$XDG_STATE_HOME/ghosttown/<session>.session.json`. The TUI serializes the

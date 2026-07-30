@@ -1,43 +1,20 @@
 import { For, createMemo } from "solid-js";
-import { helpSections, loadConfig } from "../core/config";
+import { helpLayout, loadConfig } from "../core/config";
 import { setHelpVisible, store } from "../core/state";
+import { truncate } from "./list";
 import { theme } from "./theme";
 
-/** Floating pane listing the effective (defaults + user overrides) keybinds, organized by category. */
+/**
+ * Floating pane listing the effective (defaults + user overrides) keybinds by
+ * category. The full list is taller than most terminals, so core/config lays
+ * the categories out over as many columns as it takes to fit — see helpLayout.
+ */
 export function HelpOverlay() {
-  const sections = createMemo(() => helpSections(loadConfig()));
+  const layout = createMemo(() => helpLayout(loadConfig(), store.screen));
 
-  const keyColWidth = createMemo(() => {
-    let max = 6;
-    for (const section of sections()) {
-      for (const row of section.rows) {
-        max = Math.max(max, row.keys.length);
-      }
-    }
-    return max;
-  });
-
-  const contentHeight = createMemo(() => {
-    let height = 0;
-    const sectionList = sections();
-    for (let i = 0; i < sectionList.length; i++) {
-      const section = sectionList[i]!;
-      if (i > 0) height += 1; // blank line before each category (except first)
-      height += 1; // category header
-      height += section.rows.length;
-    }
-    return height;
-  });
-
-  const width = createMemo(() =>
-    Math.min(store.screen.width - 4, keyColWidth() + 42),
-  );
-  const height = createMemo(() =>
-    Math.min(store.screen.height - 3, contentHeight() + 4),
-  );
-  const left = createMemo(() => Math.max(0, Math.floor((store.screen.width - width()) / 2)));
+  const left = createMemo(() => Math.max(0, Math.floor((store.screen.width - layout().width) / 2)));
   const top = createMemo(() =>
-    Math.max(0, Math.floor((store.screen.height - 1 - height()) / 2)),
+    Math.max(0, Math.floor((store.screen.height - 1 - layout().height) / 2)),
   );
   const prefix = loadConfig().keybinds.prefix;
 
@@ -46,8 +23,8 @@ export function HelpOverlay() {
       position="absolute"
       left={left()}
       top={top()}
-      width={width()}
-      height={height()}
+      width={layout().width}
+      height={layout().height}
       zIndex={100}
       flexDirection="column"
       backgroundColor={theme.stripBgFocused}
@@ -56,33 +33,59 @@ export function HelpOverlay() {
       title={` ghosttown · after ${prefix} `}
       onMouseDown={() => setHelpVisible(false)}
     >
-      <For each={sections()}>
-        {(section, i) => (
-          <>
-            {i() > 0 && <box height={1} backgroundColor={theme.stripBgFocused} />}
-            <text
-              content={` ${section.category}`}
-              fg={theme.accent}
-              bg={theme.stripBgFocused}
-              height={1}
-            />
-            <For each={section.rows}>
-              {(row) => (
-                <box height={1} flexDirection="row" backgroundColor={theme.stripBgFocused}>
-                  <text
-                    content={` ${row.keys.padEnd(keyColWidth())} `}
-                    fg={theme.accent}
-                    bg={theme.stripBgFocused}
-                  />
-                  <text content={row.label} fg={theme.tabFgActive} bg={theme.stripBgFocused} />
-                </box>
-              )}
-            </For>
-          </>
-        )}
-      </For>
-      <box flexGrow={1} backgroundColor={theme.stripBgFocused} />
-      <text content=" esc to close" fg={theme.tabFg} bg={theme.stripBgFocused} />
+      <box flexDirection="row" flexGrow={1} backgroundColor={theme.stripBgFocused}>
+        <For each={layout().columns}>
+          {(column) => (
+            <box
+              flexDirection="column"
+              width={layout().columnWidth}
+              flexShrink={0}
+              backgroundColor={theme.stripBgFocused}
+            >
+              <For each={column}>
+                {(section, i) => (
+                  <>
+                    {layout().spaced && i() > 0 && (
+                      <box height={1} backgroundColor={theme.stripBgFocused} />
+                    )}
+                    <text
+                      content={` ${section.category}`}
+                      fg={theme.accent}
+                      bg={theme.stripBgFocused}
+                      height={1}
+                    />
+                    <For each={section.rows}>
+                      {(row) => (
+                        <box height={1} flexDirection="row" backgroundColor={theme.stripBgFocused}>
+                          <text
+                            content={` ${row.keys.padEnd(layout().keyWidth)} `}
+                            fg={theme.accent}
+                            bg={theme.stripBgFocused}
+                          />
+                          <text
+                            content={truncate(row.label, layout().labelWidth)}
+                            fg={theme.tabFgActive}
+                            bg={theme.stripBgFocused}
+                          />
+                        </box>
+                      )}
+                    </For>
+                  </>
+                )}
+              </For>
+            </box>
+          )}
+        </For>
+      </box>
+      <text
+        content={
+          layout().clipped
+            ? " esc to close · a taller terminal shows the rest"
+            : " esc to close"
+        }
+        fg={theme.tabFg}
+        bg={theme.stripBgFocused}
+      />
     </box>
   );
 }
