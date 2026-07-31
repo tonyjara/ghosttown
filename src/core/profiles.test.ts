@@ -5,11 +5,19 @@
  * to end by scripts/harness.ts.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  listArchived,
+  snapshotPath,
+  writeSnapshot,
+  SNAPSHOT_VERSION,
+  type PersistedSession,
+} from "./persist";
+import {
   canRenameProfileTo,
+  deleteProfile,
   dialogCancel,
   dialogChar,
   dialogClear,
@@ -23,14 +31,20 @@ import {
   store,
 } from "./state";
 
-// deleteProfile cleans up after a profile whose daemon is gone; keep that (and
-// any snapshot write) inside a sandbox rather than the developer's state dir.
+// Both sandboxes are load-bearing. The state dir, because deleteProfile cleans
+// up after a profile whose daemon is gone. And the socket dir, because these
+// actions *send* to whatever answers: an unsandboxed run of this file renamed the
+// developer's own live session out from under them, since main.attach.sock was
+// right there. Profile listing walks this directory too, so pointing it at a
+// temp dir is also what makes the assertions about it deterministic.
 beforeEach(() => {
   process.env.GHOSTTOWN_STATE_DIR = mkdtempSync(join(tmpdir(), "gt-profiles-"));
+  process.env.GHOSTTOWN_SOCKET_DIR = mkdtempSync(join(tmpdir(), "gt-profiles-sock-"));
 });
 
 afterEach(() => {
   delete process.env.GHOSTTOWN_STATE_DIR;
+  delete process.env.GHOSTTOWN_SOCKET_DIR;
   dialogCancel();
   if (store.dialog) dialogCancel(); // the profile dialogs cancel back to the switcher
 });
@@ -38,6 +52,28 @@ afterEach(() => {
 const type = (text: string) => {
   for (const ch of text) dialogChar(ch);
 };
+
+/** A profile that exists only as a layout on disk — no daemon, no sockets. */
+function savedProfile(session: string): PersistedSession {
+  return {
+    version: SNAPSHOT_VERSION,
+    session,
+    savedAt: 1_700_000_000_000,
+    activeWorkspaceId: "w1",
+    sidebarVisible: true,
+    workspaces: [
+      {
+        id: "w1",
+        name: "workspace 1",
+        layout: { type: "leaf", paneId: "p1" },
+        focusedPaneId: "p1",
+        panes: [{ id: "p1", activeIdx: 0, surfaces: [{ id: "s1", cwd: "/tmp" }] }],
+      },
+    ],
+  };
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe("profile switcher", () => {
   it("opens on the profile you are in and lists it", () => {
@@ -72,6 +108,24 @@ describe("profile switcher", () => {
     expect(store.dialog).toEqual({ kind: "new-profile", value: "", back: false });
     dialogCancel();
     expect(store.dialog).toBeNull();
+  });
+
+  it("lists a profile that exists only as a saved layout, marked as stopped", () => {
+    // The reboot case. Sockets live under /tmp and are gone; the snapshot is the
+    // only trace of the arrangement, and it is enough to offer the profile.
+    writeSnapshot(savedProfile("after-reboot"));
+    expect(listProfiles()).toContain("after-reboot");
+    openSwitchProfile();
+    const d = store.dialog;
+    if (d?.kind !== "switch-profile") throw new Error("switcher did not open");
+    expect(d.stopped).toContain("after-reboot");
+    // Ours has no socket in this sandbox either, but it is the one we are in.
+    expect(d.stopped).not.toContain(store.session);
+  });
+
+  it("will not rename onto a stopped profile's name", () => {
+    writeSnapshot(savedProfile("parked"));
+    expect(canRenameProfileTo(store.session, "parked")).toBe(false);
   });
 });
 
@@ -144,5 +198,17 @@ describe("profile delete", () => {
 
     const other = profileDeleteTarget("not-the-current-profile");
     expect(other).toEqual({ self: false, landsOn: null });
+  });
+
+  it("archives a stopped profile's layout rather than deleting it", async () => {
+    writeSnapshot(savedProfile("parked"));
+    deleteProfile("parked");
+    // Nothing answers on its socket, so the cleanup path runs here rather than in
+    // the target's daemon; it is a connect failure, hence the wait.
+    await sleep(200);
+    expect(existsSync(snapshotPath("parked"))).toBe(false);
+    expect(listProfiles()).not.toContain("parked");
+    // Recoverable: `gt restore parked` puts this back.
+    expect(listArchived("parked").length).toBe(1);
   });
 });

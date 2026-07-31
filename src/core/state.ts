@@ -12,13 +12,13 @@
  * as events; on startup it adopts whatever the host still has running.
  */
 import { createStore, produce } from "solid-js/store";
-import { readdirSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import type { HostEvents } from "../control/hostclient";
 import {
   attachSocketPathFor,
-  defaultSocketDir,
   hostSocketPathFor,
   RELOAD_EXIT_CODE,
+  runningSessions,
   sanitizeSessionName,
   socketPathFor,
   type HostSurfaceInfo,
@@ -40,7 +40,13 @@ import {
   type Gutter,
 } from "./layout";
 import { desktopNotify, notifyText, screenDetail } from "./notify";
-import { deleteSnapshot, readSnapshot, SNAPSHOT_VERSION, type PersistedSession } from "./persist";
+import {
+  listSaved,
+  readSnapshot,
+  retireSnapshot,
+  SNAPSHOT_VERSION,
+  type PersistedSession,
+} from "./persist";
 import { hostSend, RuntimeRegistry, SurfaceRuntime } from "./runtime";
 import type {
   AgentStatus,
@@ -60,7 +66,12 @@ export type DialogState =
   | { kind: "rename-workspace"; workspaceId: string; value: string }
   | { kind: "rename-tab"; surfaceId: string; value: string }
   /** The profile switcher, which is also where profiles are managed (a/r/d). */
-  | { kind: "switch-profile"; sessions: string[]; idx: number }
+  /**
+   * `sessions` is every profile, running or merely saved; `stopped` marks which
+   * of them have no daemon, so the list can say so — picking one starts it and
+   * restores its layout.
+   */
+  | { kind: "switch-profile"; sessions: string[]; stopped: string[]; idx: number }
   /** `back`: opened from the switcher, so cancelling returns to it. */
   | { kind: "new-profile"; value: string; back?: boolean }
   | { kind: "rename-profile"; session: string; value: string }
@@ -199,6 +210,16 @@ export function surfaceLabel(meta: SurfaceMeta | undefined): string {
 export function activeSurfaceId(): string {
   const pane = store.panes[focusedPaneId()];
   return pane?.surfaceIds[pane.activeIdx] ?? "";
+}
+
+/**
+ * The tab a pane is showing. Everything new — a split, a tab, a workspace —
+ * opens in this one's directory, so you land where you were working rather
+ * than wherever the TUI itself was started.
+ */
+function inheritFrom(paneId: string): string | undefined {
+  const pane = store.panes[paneId];
+  return pane?.surfaceIds[pane.activeIdx];
 }
 
 /** How many tabs a workspace holds, across all its panes. */
@@ -660,6 +681,11 @@ export function hostEvents(): HostEvents {
     onSnapshot: (id, d) =>
       registry.get(id)?.feedSnapshot(Buffer.from(d, "base64").toString("utf8")),
     onExit: (id) => {
+      // A surface dying because the session is being torn down is not the user
+      // closing a tab. Acting on it walks the whole close cascade — surface →
+      // pane → workspace → and, on the last one, quit() — which drops the very
+      // snapshot a restart hands to the daemon replacing us.
+      if (tearingDown) return;
       if (store.surfaces[id]) closeSurface(id);
     },
     onStatus: (id, status, hasReporter) => {
@@ -723,6 +749,12 @@ export function hostEvents(): HostEvents {
 const PUSH_DEBOUNCE_MS = 100;
 
 let persistEnabled = false;
+/**
+ * Set once the session is on its way down by our own decision (restartApp), so
+ * the surface deaths that follow are read as teardown rather than as the user
+ * closing things. Only ever set — the process it belongs to is ending.
+ */
+let tearingDown = false;
 let pushTimer: ReturnType<typeof setTimeout> | null = null;
 
 function serializeSession(): PersistedSession {
@@ -874,6 +906,8 @@ export function createWorkspace(opts: { name?: string; command?: string; args?: 
   const wsId = nextId("w");
   const paneId = nextId("p");
   const name = opts.name ?? `workspace ${++workspaceNameCounter}`;
+  // Read before the store switches over, so it is the tab we are leaving.
+  const cwdFrom = inheritFrom(focusedPaneId());
   setStore(
     produce((s) => {
       s.workspaces[wsId] = { id: wsId, name, layout: leaf(paneId), focusedPaneId: paneId };
@@ -885,7 +919,7 @@ export function createWorkspace(opts: { name?: string; command?: string; args?: 
       s.sidebar.focused = false;
     }),
   );
-  const surfaceId = spawnSurface(paneId, opts.command, opts.args ?? []);
+  const surfaceId = spawnSurface(paneId, opts.command, opts.args ?? [], undefined, cwdFrom);
   setStore(
     produce((s) => {
       s.panes[paneId]!.surfaceIds.push(surfaceId);
@@ -1066,6 +1100,7 @@ export function splitPane(paneId: string, dir: SplitDir, command?: string, args?
   if (rect && (dir === "row" ? rect.width < 20 : rect.height < 8)) return null;
 
   const newPaneId = nextId("p");
+  const cwdFrom = inheritFrom(paneId);
   setStore(
     produce((s) => {
       s.panes[newPaneId] = { id: newPaneId, surfaceIds: [], activeIdx: 0 };
@@ -1074,7 +1109,7 @@ export function splitPane(paneId: string, dir: SplitDir, command?: string, args?
       ws.focusedPaneId = newPaneId;
     }),
   );
-  const surfaceId = spawnSurface(newPaneId, command, args ?? []);
+  const surfaceId = spawnSurface(newPaneId, command, args ?? [], undefined, cwdFrom);
   setStore(
     produce((s) => {
       s.panes[newPaneId]!.surfaceIds.push(surfaceId);
@@ -1086,12 +1121,8 @@ export function splitPane(paneId: string, dir: SplitDir, command?: string, args?
 }
 
 export function newTab(paneId: string, command?: string, args?: string[]): string | null {
-  const pane = store.panes[paneId];
-  if (!pane) return null;
-  // Tabs are appended, so the one to the new tab's left is the last one — and
-  // that is the directory to open in, not wherever the TUI itself was started.
-  const leftOf = pane.surfaceIds[pane.surfaceIds.length - 1];
-  const surfaceId = spawnSurface(paneId, command, args ?? [], undefined, leftOf);
+  if (!store.panes[paneId]) return null;
+  const surfaceId = spawnSurface(paneId, command, args ?? [], undefined, inheritFrom(paneId));
   setStore(
     produce((s) => {
       const p = s.panes[paneId]!;
@@ -1824,13 +1855,24 @@ export function snapshot(): SessionSnapshot {
   };
 }
 
-/** Kill ghosttown and everything inside it (surfaces, daemon, clients). */
-export function quit(): void {
+/**
+ * Quit: every surface in this profile dies, and the *arrangement* is written
+ * down on the way out — the next `gt` opens the same workspaces, panes, tabs and
+ * directories with fresh shells in them. Organizing a session is work, and
+ * ending its processes is not a request to throw that away.
+ *
+ * `discard` (deleting the profile) is the one case that retires the layout, and
+ * even then it lands in the archive. So does the other quit that means nothing
+ * is left: the cascade that fires when the last workspace closes.
+ */
+export function quit(opts?: { discard?: boolean }): void {
   if (pushTimer) clearTimeout(pushTimer);
-  // Quitting is a decision, not an accident: the host drops the snapshot and
-  // kills every surface, so nothing gets resurrected next time.
+  const discard = opts?.discard === true || store.workspaceOrder.length === 0;
+  // The host writes what the TUI last pushed, so make that the current layout —
+  // a split or a rename from the last few hundred ms is otherwise lost.
+  if (!discard) pushLayoutNow();
   persistEnabled = false;
-  hostSend({ t: "quit" });
+  hostSend({ t: "quit", discard });
   registry.disposeAll();
   onQuit(0);
 }
@@ -1848,6 +1890,34 @@ export function reloadApp(): void {
   setConfigForTest(null);
   // A beat for the layout frame to reach the host before the socket dies.
   setTimeout(() => onQuit(RELOAD_EXIT_CODE), 50);
+}
+
+/**
+ * Restart: the daemon steps down and the attach client starts its replacement,
+ * so BOTH halves come back on current source. That is the difference from a
+ * reload, which respawns only the TUI and leaves the daemon — and with it the
+ * pty host — running whatever code it booted with. A change under
+ * src/attach/ptyhost.ts is invisible until this runs.
+ *
+ * The price is the thing a reload was built to avoid: the surface PTYs belong
+ * to the daemon, so every shell and agent in the panes dies with it. What
+ * survives is the shape of the session — the daemon flushes its snapshot on
+ * the way out (while the pids are still alive, so each surface's live cwd is
+ * recorded) and the next TUI restores from it, bringing back workspaces, panes,
+ * tabs, names and directories with fresh shells in them.
+ *
+ * No-op when not under a daemon: with GHOSTTOWN_NO_DAEMON=1 there is nothing
+ * to restart into.
+ */
+export function restartApp(): void {
+  if (!process.env.GHOSTTOWN_ATTACH_SOCKET) return;
+  pushLayoutNow();
+  // From here the surfaces are going to die, and none of those deaths mean
+  // what a death normally means (see onExit in hostEvents).
+  tearingDown = true;
+  // Same beat as a reload — the layout frame has to land before we ask the
+  // daemon to snapshot it and go.
+  setTimeout(() => sendDaemonCmd({ t: "cmd", cmd: "restart" }), 50);
 }
 
 /**
@@ -1918,15 +1988,16 @@ export function detachClients(): void {
 // ---------------------------------------------------------------------------
 
 /** Every profile with a daemon socket, plus the current one. Sorted. */
+/**
+ * Every profile the switcher can offer: the running ones, plus the ones that
+ * exist only as a saved layout. That second half is what makes a stopped profile
+ * findable — the sockets it used to be listed from live under /tmp and do not
+ * survive a reboot, so without this an afternoon's worth of arranging would be
+ * unreachable unless you happened to remember the name to pass to --session.
+ */
 export function listProfiles(): string[] {
-  const names = new Set<string>([store.session]);
-  try {
-    for (const f of readdirSync(defaultSocketDir())) {
-      if (f.endsWith(".attach.sock")) names.add(f.slice(0, -".attach.sock".length));
-    }
-  } catch {
-    // socket dir may not exist yet
-  }
+  const names = new Set<string>([store.session, ...runningSessions()]);
+  for (const saved of listSaved()) names.add(saved.session);
   return [...names].sort();
 }
 
@@ -1938,9 +2009,11 @@ export function listProfiles(): string[] {
  */
 export function openSwitchProfile(select?: string, exclude?: string): void {
   const sessions = listProfiles().filter((name) => name !== exclude);
+  const running = new Set([store.session, ...runningSessions()]);
   setDialog({
     kind: "switch-profile",
     sessions,
+    stopped: sessions.filter((name) => !running.has(name)),
     idx: Math.max(0, sessions.indexOf(select ?? store.session)),
   });
 }
@@ -2012,9 +2085,11 @@ export function profileDeleteTarget(name: string): { self: boolean; landsOn: str
 }
 
 /**
- * Kill a profile and everything in it: its daemon stops every surface (agents
- * included), drops the session snapshot and removes its sockets. There is no
- * undo — the dialog asks first.
+ * Delete a profile and everything in it: its daemon stops every surface (agents
+ * included), removes its sockets and retires the session snapshot. The layout
+ * goes to the archive rather than /dev/null, so `gt restore` can undo a
+ * mis-aimed confirm — but as far as the switcher is concerned the profile is
+ * gone. Merely *stopping* a profile is `kill`, which keeps everything.
  */
 export function deleteProfile(name: string): void {
   const target = sanitizeSessionName(name);
@@ -2023,9 +2098,11 @@ export function deleteProfile(name: string): void {
   dbg("deleteProfile", target, { self, landsOn });
 
   if (!self) {
-    // Another profile: tell its daemon to tear itself down. A socket nothing
-    // answers on is the leftover of a crash — clean up after it ourselves.
-    sendAttachCmds(attachSocketPathFor(target), [{ t: "cmd", cmd: "kill" }], () =>
+    // Another profile: tell its daemon to tear itself down and retire its own
+    // snapshot — it owns that file, and doing it from here would race the flush
+    // on its way out. A socket nothing answers on is the leftover of a crash (or
+    // a profile that only exists on disk) — clean up after it ourselves.
+    sendAttachCmds(attachSocketPathFor(target), [{ t: "cmd", cmd: "delete" }], () =>
       forgetDeadProfile(target),
     );
     // Its socket lingers for a moment; keep managing profiles without it.
@@ -2034,17 +2111,17 @@ export function deleteProfile(name: string): void {
   }
   const own = ownAttachSocket();
   // Nowhere to send the clients — the only profile left, or no daemon to move
-  // them with — makes this a quit, which already means "kill everything in here
-  // and do not resurrect it".
+  // them with — makes this a quit. `discard` because it is still a delete: an
+  // ordinary quit would keep the layout for next time.
   if (!own || !landsOn) {
-    quit();
+    quit({ discard: true });
     return;
   }
   // Move the clients to the surviving profile first, then pull this one down:
-  // a kill on its own would drop the user out of ghosttown altogether.
+  // a delete on its own would drop the user out of ghosttown altogether.
   sendAttachCmds(own, [
     { t: "cmd", cmd: "switch", session: landsOn },
-    { t: "cmd", cmd: "kill" },
+    { t: "cmd", cmd: "delete" },
   ]);
 }
 
@@ -2062,7 +2139,7 @@ function forgetDeadProfile(name: string): void {
       // already gone
     }
   }
-  deleteSnapshot(name);
+  retireSnapshot(name);
 }
 
 /**

@@ -8,8 +8,15 @@
  * a `bye reason:"switch"` naming the target session; we reset the terminal
  * and re-enter the attach loop against that session, starting its daemon if
  * needed. The old session keeps running detached.
+ *
+ * Restart (prefix+B): the same trick pointed back at the session we are
+ * already on. The daemon tears itself down and we start its replacement, which
+ * is how the pty host gets to come back on current source — a reload only
+ * reaches the TUI. This client process is the one thing that survives both, so
+ * the terminal never leaves raw mode and the user keeps their window.
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   attachSocketPathFor,
@@ -29,6 +36,17 @@ const RESTORE =
   "\x1b[?1049l\x1b[?25h\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Wait for a daemon to release its attach socket — it unlinks all three of its
+ * paths on the way out. Bounded, because a daemon wedged in teardown must not
+ * strand the client here: on timeout we try to reattach anyway and fail there,
+ * where there is an error message for it.
+ */
+async function waitForSocketGone(path: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (existsSync(path) && Date.now() < deadline) await sleep(60);
+}
 
 type AttachOutcome =
   | { kind: "no-daemon" }
@@ -108,6 +126,19 @@ export async function runAttachClient(opts: AttachOpts): Promise<void> {
       // Reset modes the old TUI enabled; the next daemon replays its own.
       process.stdout.write(RESTORE);
       session = outcome.target;
+      command = undefined;
+      args = undefined;
+      continue;
+    }
+    if (outcome.kind === "closed" && outcome.reason === "restart") {
+      // The daemon is stepping aside so the next one comes up on current
+      // source. Unlike a switch we go back to the SAME name, which means
+      // waiting for the old daemon to let go of the socket first: reconnecting
+      // to one that is on its way out reads as an ordinary close, and we would
+      // quit instead of coming back. Once it is gone the loop finds no daemon
+      // and starts one, which restores the session from the snapshot.
+      process.stdout.write(RESTORE);
+      await waitForSocketGone(attachSocketPathFor(session));
       command = undefined;
       args = undefined;
       continue;

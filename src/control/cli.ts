@@ -4,11 +4,20 @@
  */
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { loadConfig } from "../core/config";
 import { activateApp, terminalApp } from "../core/notify";
+import {
+  archiveDir,
+  listArchived,
+  listSaved,
+  restoreArchived,
+  snapshotPath,
+  SNAPSHOT_VERSION,
+  type ArchivedSnapshot,
+} from "../core/persist";
 import { request } from "./client";
-import { socketPathFor } from "./protocol";
+import { attachSocketPathFor, runningSessions, sanitizeSessionName, socketPathFor } from "./protocol";
 import type { SessionSnapshot } from "../core/types";
 
 const HELP = `ghosttown — agent-first terminal multiplexer
@@ -32,6 +41,12 @@ subcommands (run from inside a session, or with GHOSTTOWN_SOCKET set):
                                 jump to a surface: its workspace, pane and tab
   hooks print                   show Claude Code hooks JSON
   hooks setup                   merge hooks into ~/.claude/settings.json
+
+profiles & layouts (no session needed — these read the state dir):
+  profiles [-a|--archived]      every profile, running or saved; -a lists
+                                retired layouts
+  restore <profile> [--from <file>]
+                                put an archived layout back as the live one
 `;
 
 interface Parsed {
@@ -151,6 +166,102 @@ function formatList(snap: SessionSnapshot): string {
     }
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Profiles & recovery. These read the state dir instead of a socket, which is
+// the whole point: they are what you reach for when nothing is running — after a
+// reboot, or after a delete you did not mean.
+// ---------------------------------------------------------------------------
+
+function stamp(ms: number): string {
+  if (!ms) return "-";
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+const layoutOf = (s: ArchivedSnapshot | undefined) =>
+  s ? `${plural(s.workspaces, "workspace")}, ${plural(s.surfaces, "tab")}` : "no saved layout";
+
+/** Left-align every column to the widest cell in it. */
+function table(rows: string[][]): string {
+  const widths = rows[0]?.map((_, i) => Math.max(...rows.map((r) => (r[i] ?? "").length))) ?? [];
+  return rows
+    .map((r) => r.map((cell, i) => (i === r.length - 1 ? cell : cell.padEnd(widths[i]!))).join("  "))
+    .join("\n");
+}
+
+/** Running profiles and saved ones in one list — the same set the switcher shows. */
+function formatProfiles(): string {
+  const running = new Set(runningSessions());
+  const saved = new Map(listSaved().map((s) => [s.session, s]));
+  const names = [...new Set([...running, ...saved.keys()])].sort();
+  if (names.length === 0) return "no profiles yet — `gt` starts one";
+  const rows = [
+    ["PROFILE", "STATE", "LAYOUT", "SAVED"],
+    ...names.map((name) => {
+      const s = saved.get(name);
+      return [name, running.has(name) ? "running" : "saved", layoutOf(s), stamp(s?.savedAt ?? 0)];
+    }),
+  ];
+  return `${table(rows)}\n\nstart a saved profile with: gt --session <name>`;
+}
+
+function formatArchived(entries: ArchivedSnapshot[]): string {
+  if (entries.length === 0) return `nothing archived yet (${archiveDir()})`;
+  const rows = [
+    ["PROFILE", "LAYOUT", "SAVED", "FILE"],
+    ...entries.map((e) => [e.session, layoutOf(e), stamp(e.savedAt), basename(e.path)]),
+  ];
+  return `${table(rows)}\n\nput one back with: gt restore <profile> [--from <file>]`;
+}
+
+/**
+ * Bring an archived layout back as the live snapshot. Newest for that profile by
+ * default; `--from` picks an older one, by path or by the bare filename the
+ * listing prints. Whatever is live now is archived first, so this is undoable
+ * too.
+ */
+function restoreProfile(name: string, from: string | boolean | undefined): void {
+  const session = sanitizeSessionName(name);
+  if (!session) {
+    console.error(`gt restore: "${name}" is not a usable profile name`);
+    process.exit(1);
+  }
+  // A running daemon holds the layout in memory and writes it every 30s, so it
+  // would undo the restore within the minute.
+  if (existsSync(attachSocketPathFor(session))) {
+    console.error(`gt restore: "${session}" is running — stop that session first`);
+    process.exit(1);
+  }
+  let path = typeof from === "string" ? from : listArchived(session)[0]?.path;
+  if (typeof from === "string" && !existsSync(path!)) path = join(archiveDir(), from);
+  if (!path) {
+    console.error(`gt restore: nothing archived for "${session}" (gt profiles -a)`);
+    process.exit(1);
+  }
+  if (!existsSync(path)) {
+    console.error(`gt restore: no such file: ${path}`);
+    process.exit(1);
+  }
+  const done = restoreArchived(path);
+  if (!done) {
+    console.error(`gt restore: ${path} is not a session snapshot`);
+    process.exit(1);
+  }
+  if (done.session !== session) {
+    console.log(`note: that file belongs to profile "${done.session}" — restored there`);
+  }
+  console.log(`restored ${layoutOf(done)} → ${snapshotPath(done.session)}`);
+  if (done.version !== SNAPSHOT_VERSION) {
+    console.log(
+      `warning: snapshot version ${done.version}, this build reads ${SNAPSHOT_VERSION} — it will be ignored on start`,
+    );
+  }
+  console.log(`open it with: gt --session ${done.session}`);
 }
 
 function hooksConfig(): Record<string, unknown> {
@@ -303,6 +414,24 @@ export async function runCli(argv: string[]): Promise<void> {
         else console.log(JSON.stringify(hooksConfig(), null, 2));
         return;
       }
+      // The next two need no session: they read the state dir directly, which is
+      // the point — they are what you reach for when nothing is running.
+      case "profiles": {
+        // `-a` is a bare word to the generic parser (only `-d` is special-cased
+        // there, for split), so look for it where it actually lands.
+        const archived = parsed.flags["archived"] === true || parsed.positional.includes("-a");
+        console.log(archived ? formatArchived(listArchived()) : formatProfiles());
+        return;
+      }
+      case "restore": {
+        const name = parsed.positional[0];
+        if (!name) {
+          console.error("usage: gt restore <profile> [--from <archived-file>]");
+          process.exit(1);
+        }
+        restoreProfile(name, parsed.flags["from"]);
+        return;
+      }
       default:
         console.error(`unknown subcommand: ${sub}\n`);
         console.log(HELP);
@@ -329,4 +458,6 @@ export const CLI_SUBCOMMANDS = new Set([
   "notify",
   "focus",
   "hooks",
+  "profiles",
+  "restore",
 ]);

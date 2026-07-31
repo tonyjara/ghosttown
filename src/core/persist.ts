@@ -13,8 +13,25 @@
  *
  * The pty host writes the file, since it owns the pids the cwds come from;
  * state.ts serializes the structure and sends it over.
+ *
+ * A layout is *organized work* — it can take longer to arrange than the panes
+ * take to fill — so nothing here destroys one outright. Ending processes never
+ * touches the file (that is what stopping a session means), and the two places
+ * that do retire a snapshot — deleting a profile, and a write that would shrink
+ * one — move it into `archive/` instead of unlinking it. `gt profiles -a` lists
+ * what is in there and `gt restore` puts one back.
  */
-import { existsSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { dbg } from "./debug";
@@ -63,10 +80,200 @@ export function stateDir(): string {
   return join(xdg, "ghosttown");
 }
 
+const SUFFIX = ".session.json";
+
+/**
+ * Profile names are already path-safe (see dialogChar), but a stray slash from
+ * --session would escape the directory.
+ */
+const safeName = (session: string) => session.replace(/[^\w.-]/g, "_");
+
 export function snapshotPath(session: string): string {
-  // Profile names are already path-safe (see dialogChar), but a stray slash
-  // from --session would escape the directory.
-  return join(stateDir(), `${session.replace(/[^\w.-]/g, "_")}.session.json`);
+  return join(stateDir(), `${safeName(session)}${SUFFIX}`);
+}
+
+/** Retired snapshots, kept beside the live ones. See archiveSnapshot. */
+export function archiveDir(): string {
+  return join(stateDir(), "archive");
+}
+
+/** How many retired snapshots to keep — per profile, so one cannot evict another. */
+export const ARCHIVE_KEEP = 20;
+
+const archivePathAt = (session: string, stamp: number) =>
+  join(archiveDir(), `${safeName(session)}.${stamp}${SUFFIX}`);
+
+/** Workspaces + panes + tabs: the unit a "this layout got smaller" check counts in. */
+function structureSize(snap: PersistedSession): number {
+  let n = 0;
+  for (const ws of snap.workspaces ?? []) {
+    n += 1;
+    for (const pane of ws.panes ?? []) n += 1 + (pane.surfaces?.length ?? 0);
+  }
+  return n;
+}
+
+/** Parse with no version gate: a file this build cannot use is still worth keeping. */
+function readRaw(path: string): PersistedSession | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as PersistedSession;
+    return parsed && Array.isArray(parsed.workspaces) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface ArchivedSnapshot {
+  path: string;
+  /** Profile it belonged to — read from the file, not parsed out of the name. */
+  session: string;
+  savedAt: number;
+  version: number;
+  workspaces: number;
+  surfaces: number;
+}
+
+/**
+ * Retire the live snapshot instead of deleting it: it moves to
+ * `archive/<profile>.<savedAt>.session.json`, oldest falling off past
+ * ARCHIVE_KEEP. Returns where it landed, or null if there was nothing to move.
+ */
+export function archiveSnapshot(session: string): string | null {
+  const from = snapshotPath(session);
+  if (!existsSync(from)) return null;
+  try {
+    mkdirSync(archiveDir(), { recursive: true, mode: 0o700 });
+    const saved = readRaw(from)?.savedAt;
+    const stamp = Math.round(Number(saved) || statSync(from).mtimeMs);
+    let to = archivePathAt(session, stamp);
+    // Two retirements can share a millisecond; nudge rather than overwrite.
+    for (let n = 1; existsSync(to) && n < 1000; n++) to = archivePathAt(session, stamp + n);
+    renameSync(from, to);
+    pruneArchive(session);
+    dbg("persist: archived", from, "→", to);
+    return to;
+  } catch (err) {
+    dbg("persist: archive failed", from, err as Error);
+    return null;
+  }
+}
+
+/**
+ * Remove the file outright. Only for a rename, where the very same layout is
+ * rewritten under the new profile name a moment later — everything else that
+ * retires a snapshot goes through retireSnapshot.
+ */
+export function dropSnapshot(session: string): void {
+  try {
+    rmSync(snapshotPath(session), { force: true });
+  } catch (err) {
+    dbg("persist: drop failed", err as Error);
+  }
+}
+
+/**
+ * This profile is going away for good (an explicit delete). Archive rather than
+ * unlink so a mis-aimed confirm stays recoverable — but if the archive cannot
+ * be written, the file still has to go, or the profile would come back.
+ */
+export function retireSnapshot(session: string): string | null {
+  const to = archiveSnapshot(session);
+  if (!to && existsSync(snapshotPath(session))) dropSnapshot(session);
+  return to;
+}
+
+/** Archived snapshots, newest first; for one profile or all of them. */
+export function listArchived(session?: string): ArchivedSnapshot[] {
+  const out: ArchivedSnapshot[] = [];
+  let files: string[] = [];
+  try {
+    files = readdirSync(archiveDir());
+  } catch {
+    return out; // nothing retired yet
+  }
+  const prefix = session ? `${safeName(session)}.` : "";
+  for (const f of files) {
+    if (!f.endsWith(SUFFIX) || !f.startsWith(prefix)) continue;
+    const path = join(archiveDir(), f);
+    const snap = readRaw(path);
+    if (!snap) continue;
+    if (session && snap.session !== session) continue;
+    out.push(describe(path, snap));
+  }
+  return out.sort((a, b) => b.savedAt - a.savedAt);
+}
+
+function describe(path: string, snap: PersistedSession): ArchivedSnapshot {
+  let surfaces = 0;
+  for (const ws of snap.workspaces) for (const p of ws.panes ?? []) surfaces += p.surfaces?.length ?? 0;
+  let savedAt = Number(snap.savedAt) || 0;
+  if (!savedAt) {
+    try {
+      savedAt = statSync(path).mtimeMs;
+    } catch {
+      savedAt = 0;
+    }
+  }
+  return {
+    path,
+    session: snap.session,
+    savedAt,
+    version: Number(snap.version) || 0,
+    workspaces: snap.workspaces.length,
+    surfaces,
+  };
+}
+
+function pruneArchive(session: string): void {
+  for (const old of listArchived(session).slice(ARCHIVE_KEEP)) {
+    try {
+      rmSync(old.path, { force: true });
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/**
+ * Every profile with a snapshot this build could actually restore. What makes a
+ * stopped profile findable: the sockets it was listed from live in /tmp and do
+ * not survive a reboot, but this does.
+ */
+export function listSaved(): ArchivedSnapshot[] {
+  const out: ArchivedSnapshot[] = [];
+  let files: string[] = [];
+  try {
+    files = readdirSync(stateDir());
+  } catch {
+    return out;
+  }
+  for (const f of files) {
+    if (!f.endsWith(SUFFIX)) continue;
+    const path = join(stateDir(), f);
+    const snap = readRaw(path);
+    if (!snap?.session || snap.version !== SNAPSHOT_VERSION || snap.workspaces.length === 0) continue;
+    out.push(describe(path, snap));
+  }
+  return out.sort((a, b) => b.savedAt - a.savedAt);
+}
+
+/**
+ * Put an archived snapshot back as its profile's live one, retiring whatever is
+ * there now — so this is itself undoable. The file is copied verbatim: a
+ * version this build cannot read is the caller's problem to report.
+ */
+export function restoreArchived(path: string): ArchivedSnapshot | null {
+  const snap = readRaw(path);
+  if (!snap?.session) return null;
+  archiveSnapshot(snap.session);
+  try {
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    writeFileSync(snapshotPath(snap.session), JSON.stringify(snap), { mode: 0o600 });
+  } catch (err) {
+    dbg("persist: restore failed", path, err as Error);
+    return null;
+  }
+  return describe(path, snap);
 }
 
 /** Atomic: a half-written snapshot is worse than a stale one. */
@@ -74,6 +281,7 @@ export function writeSnapshot(snap: PersistedSession): void {
   const path = snapshotPath(snap.session);
   try {
     mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    archiveIfShrinking(path, snap);
     const tmp = `${path}.tmp`;
     writeFileSync(tmp, JSON.stringify(snap), { mode: 0o600 });
     renameSync(tmp, path);
@@ -82,29 +290,44 @@ export function writeSnapshot(snap: PersistedSession): void {
   }
 }
 
+/**
+ * The write that can cost real work is a *smaller* layout landing on a bigger
+ * one: a session that started fresh over a snapshot it could not read, or a
+ * whole workspace closed by accident. Keep the old copy before it goes under.
+ * A single closed tab is not worth a file — losing a workspace, or two units of
+ * structure at once, is.
+ */
+function archiveIfShrinking(path: string, next: PersistedSession): void {
+  if (!existsSync(path)) return;
+  const prev = readRaw(path);
+  if (!prev) return;
+  const lost = structureSize(prev) - structureSize(next);
+  if (lost < 2 && prev.workspaces.length <= next.workspaces.length) return;
+  dbg("persist: layout shrank, archiving first", {
+    was: structureSize(prev),
+    now: structureSize(next),
+  });
+  archiveSnapshot(next.session);
+}
+
 export function readSnapshot(session: string): PersistedSession | null {
   const path = snapshotPath(session);
   if (!existsSync(path)) return null;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as PersistedSession;
     if (parsed?.version !== SNAPSHOT_VERSION) {
+      // Used to be a silent loss: unreadable here, then overwritten by the
+      // fresh session that started in its place.
       dbg("persist: ignoring snapshot from another version", parsed?.version);
+      archiveSnapshot(session);
       return null;
     }
     if (!Array.isArray(parsed.workspaces) || parsed.workspaces.length === 0) return null;
     return parsed;
   } catch (err) {
     dbg("persist: unreadable snapshot", path, err as Error);
+    archiveSnapshot(session);
     return null;
-  }
-}
-
-/** An explicit quit means "this session is over" — don't resurrect it. */
-export function deleteSnapshot(session: string): void {
-  try {
-    rmSync(snapshotPath(session), { force: true });
-  } catch (err) {
-    dbg("persist: delete failed", err as Error);
   }
 }
 

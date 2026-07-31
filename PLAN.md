@@ -182,8 +182,12 @@ scrollback).
   `$XDG_STATE_HOME/ghosttown/<session>.session.json`. The TUI serializes the
   structure and the pty host writes the file, since it owns the pids the cwds
   come from; on structural changes and every 30s. Consulted only on a *cold*
-  start now, where a restored surface is a fresh shell in its old directory. An
-  explicit quit/kill drops the snapshot).
+  start now, where a restored surface is a fresh shell in its old directory.
+  Nothing that merely *stops* a session touches the file — quit, kill, SIGTERM
+  and reboot all flush it and leave it, and the profile list reads the state dir
+  so a stopped profile is still offered. Only deleting a profile retires a
+  layout, and that moves it to `archive/`, where `gt profiles -a` and
+  `gt restore` can reach it).
 - ~~Surfaces in the daemon~~ (shipped as `src/attach/ptyhost.ts`: the daemon
   owns every surface pty, the scanner, the status engine and a bounded raw
   replay buffer; the TUI is a client over `<session>.host.sock` and adopts live

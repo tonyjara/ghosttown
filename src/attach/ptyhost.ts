@@ -29,9 +29,10 @@ import { loadConfig, reloadConfig, watchConfig, type Config } from "../core/conf
 import { MOUSE_MODES_OFF, type MouseModes } from "../core/mouse";
 import {
   cwdsOf,
-  deleteSnapshot,
+  dropSnapshot,
   readCwds,
   readCwdsAsync,
+  retireSnapshot,
   withCwds,
   writeSnapshot,
   type PersistedSession,
@@ -150,8 +151,14 @@ export interface PtyHost {
   setSession(session: string): void;
   /** Kill every surface and stop the timers (daemon shutdown). */
   closeAll(): void;
-  /** Blocking snapshot write, for the way out. */
-  flushSnapshotSync(): void;
+  /**
+   * Blocking snapshot write, for the way out. `readDirs: false` skips the lsof
+   * and writes the directories from the last pass — for the signal path, where
+   * the OS is counting the milliseconds until it sends SIGKILL.
+   */
+  flushSnapshotSync(readDirs?: boolean): void;
+  /** This profile is being deleted: retire its snapshot and stop writing. */
+  discardSnapshot(): void;
   surfaceCount(): number;
 }
 
@@ -176,6 +183,8 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
   >();
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let savingNow = false;
+  /** Set by closeAll: the daemon is going down, so the TUI's last words are noise. */
+  let closing = false;
   // The daemon reads the config too, so [agents] changes apply to a running
   // session the same way every other setting does.
   let config: Config = loadConfig();
@@ -252,11 +261,23 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     }, SAVE_DEBOUNCE_MS);
   };
 
-  const flushSnapshotSync = (): void => {
+  const flushSnapshotSync = (readDirs = true): void => {
     if (!layout) return;
-    const owners = pids();
-    stamp(owners, readCwds(owners.map(([, pid]) => pid)));
+    if (readDirs) {
+      const owners = pids();
+      stamp(owners, readCwds(owners.map(([, pid]) => pid)));
+    }
     if (layout && persist) writeSnapshot(layout);
+  };
+
+  /** The profile is being deleted — the one path that retires a snapshot. */
+  const discardSnapshot = (): void => {
+    persist = false;
+    layout = null;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    const to = retireSnapshot(session);
+    log("snapshot retired", to ?? "(nothing to retire)");
   };
 
   // --- surfaces -----------------------------------------------------------
@@ -328,10 +349,11 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
   }
 
   /**
-   * Where a sibling surface is sitting right now. A new tab starts next to the
-   * one before it, so this is read live rather than taken from the snapshot —
-   * the last save can predate a `cd`. Blocking, but it is one lsof (~40ms, and
-   * a readlink on Linux) per new tab, on the daemon rather than the render loop.
+   * Where a sibling surface is sitting right now. Anything new starts in the
+   * directory of the tab it was created from, so this is read live rather than
+   * taken from the snapshot — the last save can predate a `cd`. Blocking, but
+   * it is one lsof (~40ms, and a readlink on Linux) per spawn, on the daemon
+   * rather than the render loop.
    */
   const cwdOfSurface = (id: string): string | null => {
     const pid = surfaces.get(id)?.pty?.pid;
@@ -459,6 +481,13 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
   // --- frame handling -----------------------------------------------------
 
   const handle = (frame: HostClientFrame, send: Sender): void => {
+    // Once the daemon is on its way out, the TUI is still alive for a moment and
+    // watching every surface die at once — which it reads as the user closing
+    // things, so it walks the close cascade and ends up sending a layout with
+    // half the workspaces missing, then a quit. Acting on either would undo the
+    // snapshot the shutdown just flushed. Nothing it says from here can matter:
+    // the surfaces are gone and the process is exiting.
+    if (closing) return;
     switch (frame.t) {
       case "hello": {
         client = send;
@@ -551,10 +580,12 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
         scheduleSave();
         return;
       case "quit":
-        // An explicit quit is a decision: nothing to resurrect next time.
-        persist = false;
-        layout = null;
-        deleteSnapshot(session);
+        // A quit ends the processes, not the arrangement: flush what the TUI
+        // last pushed and leave it on disk, so the next start comes back to the
+        // same workspaces. Only deleting the profile asks for the layout itself
+        // to go — that arrives as `discard`.
+        if (frame.discard) discardSnapshot();
+        else flushSnapshotSync();
         for (const id of [...surfaces.keys()]) killSurface(id);
         return;
     }
@@ -571,7 +602,9 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     setSession(next) {
       if (!next || next === session) return;
       log("session renamed", session, "→", next);
-      deleteSnapshot(session);
+      // Not a retirement: the same layout is written back out under the new
+      // name a moment later, so archiving it would only make noise.
+      dropSnapshot(session);
       session = next;
       if (layout) {
         layout = { ...layout, session: next };
@@ -585,6 +618,7 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
       }
     },
     closeAll() {
+      closing = true;
       clearInterval(tick);
       clearInterval(saveInterval);
       if (agentTimer) clearInterval(agentTimer);
@@ -596,6 +630,7 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
       client = null;
     },
     flushSnapshotSync,
+    discardSnapshot,
     surfaceCount: () => surfaces.size,
   };
 }

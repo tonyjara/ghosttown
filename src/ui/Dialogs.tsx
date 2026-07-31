@@ -38,6 +38,12 @@ export function DialogOverlay() {
     return d?.kind === "switch-profile" ? d.sessions : [];
   });
 
+  /** Of those, the ones with no daemon — listed from their saved layout. */
+  const stopped = createMemo(() => {
+    const d = dialog();
+    return d?.kind === "switch-profile" ? d.stopped : [];
+  });
+
   const items = createMemo(() => (finder() ? finderItems() : []));
 
   const selectedIdx = () => {
@@ -127,13 +133,15 @@ export function DialogOverlay() {
     }
   };
 
-  /** Two lines: what the kill takes with it, and where it leaves you. */
+  /** Two lines: what the delete takes with it, and where it leaves you. */
   const deleteProfileLines = createMemo((): string[] => {
     const d = dialog();
     if (d?.kind !== "confirm-delete-profile") return [];
     const { self, landsOn } = profileDeleteTarget(d.session);
-    const head = ` Kill "${d.session}" and everything in it?`;
-    if (!self) return [head, " Its agents and shells are stopped for good."];
+    const head = ` Delete "${d.session}" and everything in it?`;
+    // The processes really are gone; the layout is only archived, and saying so
+    // is the difference between a scary confirm and an accurate one.
+    if (!self) return [head, " Shells and agents stop; the layout is archived."];
     if (landsOn) return [head, ` You are in it — this client moves to "${landsOn}".`];
     return [head, " It is the only one: this quits ghosttown."];
   });
@@ -206,9 +214,18 @@ export function DialogOverlay() {
           {(name, i) => {
             const selected = () => i() === selectedIdx();
             const current = () => name === store.session;
+            // A profile with no daemon is still listed: its layout is on disk,
+            // and picking it starts a session that restores it. Say so, or a
+            // stopped profile reads as a running one that lost its panes.
+            const tag = () => (stopped().includes(name) ? "saved" : "");
+            const row = () => {
+              const left = ` ${current() ? "●" : " "} ${name}`;
+              const pad = Math.max(1, width() - 2 - left.length - tag().length);
+              return truncate(left + " ".repeat(pad) + tag(), width() - 2).padEnd(width() - 2);
+            };
             return (
               <text
-                content={` ${current() ? "●" : " "} ${name}`.padEnd(width() - 2)}
+                content={row()}
                 fg={selected() ? theme.tabFgActive : current() ? theme.accent : theme.tabFg}
                 bg={selected() ? theme.sidebarSelBg : theme.stripBgFocused}
                 onMouseDown={() => dialogPick(i())}
@@ -223,7 +240,7 @@ export function DialogOverlay() {
           bg={theme.stripBgFocused}
         />
         <text
-          content={truncate(" a new · r rename · d kill", width() - 2)}
+          content={truncate(" a new · r rename · d delete", width() - 2)}
           fg={theme.tabFg}
           bg={theme.stripBgFocused}
         />

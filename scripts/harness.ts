@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { OutputScanner } from "../src/core/queries";
 import { attachSocketPathFor, socketPathFor } from "../src/control/protocol";
-import { snapshotPath } from "../src/core/persist";
+import { listArchived, readSnapshot, snapshotPath } from "../src/core/persist";
 import { join } from "node:path";
 
 const COLS = 100;
@@ -28,6 +28,8 @@ const sessionB = `harness-${process.pid}-b`;
 const sessionC = `harness-${process.pid}-c`;
 /** A throwaway profile, created with "a" and then deleted from the inside. */
 const sessionD = `harness-${process.pid}-d`;
+/** Started fresh at the end, to have a daemon to SIGTERM (the reboot test). */
+const sessionE = `harness-${process.pid}-e`;
 const entry = join(import.meta.dir, "..", "src", "index.ts");
 
 // A user config override, to prove custom settings win over defaults:
@@ -61,6 +63,7 @@ const attachSocket = attachSocketPathFor(session);
 const attachSocketB = attachSocketPathFor(sessionB);
 const attachSocketC = attachSocketPathFor(sessionC);
 const attachSocketD = attachSocketPathFor(sessionD);
+const attachSocketE = attachSocketPathFor(sessionE);
 // Every GHOSTTOWN_* var is dropped first: running the harness from inside a
 // real ghosttown session would otherwise leak that session's GHOSTTOWN_SOCKET
 // into the children, and `gt send-text` would type into the developer's own
@@ -167,6 +170,16 @@ function expect(label: string, cond: boolean, detail = ""): void {
 }
 
 const PREFIX = "\x01"; // Ctrl+A
+
+/** A session's daemon pid, or 0 — the proof that a restart really replaced it. */
+function daemonPid(name: string): number {
+  const out = Bun.spawnSync(["ps", "-eo", "pid,args"]).stdout.toString();
+  for (const line of out.split("\n")) {
+    if (!line.includes(`__daemon --session ${name}`)) continue;
+    return Number(line.trim().split(/\s+/)[0]) || 0;
+  }
+  return 0;
+}
 
 async function main(): Promise<void> {
   await sleep(4000); // two bun cold starts (client+daemon, tui) + shell prompt
@@ -1100,6 +1113,44 @@ async function main(): Promise<void> {
   pty.write("kill %1 2>/dev/null; wait 2>/dev/null\r");
   await sleep(600);
 
+  // --- Restart (prefix+B) --------------------------------------------------
+  // The other half of the dev loop: a reload respawns the TUI, a restart takes
+  // the daemon with it, so pty-host changes actually land. Only the client
+  // survives. The session is rebuilt from the snapshot the daemon flushes on
+  // the way out — same workspaces, tabs, names and directories — but every
+  // shell in it is new, which is the whole trade and worth asserting both ways.
+  {
+    const pidBefore = daemonPid(session);
+    expect("found the daemon before the restart", pidBefore > 0);
+    pty.write(PREFIX);
+    await sleep(120);
+    pty.write("B");
+    // Daemon teardown, then two bun cold starts (daemon, tui) and a prompt.
+    await sleep(11000);
+    text = term.getText();
+    console.log(frame("after restart"));
+    const pidAfter = daemonPid(session);
+    expect("client survives the restart", !exited);
+    expect(
+      "the daemon itself was replaced",
+      pidAfter > 0 && pidAfter !== pidBefore,
+      `before=${pidBefore} after=${pidAfter}`,
+    );
+    expect("workspaces come back from the snapshot", text.includes("WORKSPACES (2)"));
+    // A fresh shell in the same directory: the cwd is restored (and with it the
+    // active workspace, since that shell lives in the second one), the process
+    // is not. $SURVIVOR only exists in the shell that set it before the reload.
+    pty.write('echo "survivor=[$SURVIVOR]"; basename "$PWD"\r');
+    await sleep(1200);
+    text = term.getText();
+    console.log(frame("fresh shell after restart"));
+    expect("restored surface keeps its directory", text.includes("cwd_marker_dir"));
+    expect(
+      "the shell is a new process (panes do not survive a restart)",
+      text.includes("survivor=[]"),
+    );
+  }
+
   // --- Config hot reload -------------------------------------------------
   // Saving the config applies it in place: no reload, no restart, and the
   // surfaces (which the pty host owns) replay into the remounted UI.
@@ -1206,7 +1257,7 @@ async function main(): Promise<void> {
   await sleep(600);
   text3 = term2.getText();
   console.log(frame("profile switcher", term2));
-  expect("switcher lists both profiles", text3.includes("a new · r rename · d kill"));
+  expect("switcher lists both profiles", text3.includes("a new · r rename · d delete"));
 
   // "a" is the new-profile input again — no second daemon, just the dialog.
   pty2.write("a");
@@ -1215,7 +1266,7 @@ async function main(): Promise<void> {
   pty2.write("\x1b"); // esc goes BACK to the switcher, not away
   await sleep(400);
   text3 = term2.getText();
-  expect("esc returns to the switcher", text3.includes("d kill") && !text3.includes("new profile"));
+  expect("esc returns to the switcher", text3.includes("d delete") && !text3.includes("new profile"));
 
   // "r" renames the selected profile — B, the one we are in — in place. The
   // panes are untouched: the daemon just moves its sockets and snapshot.
@@ -1248,7 +1299,9 @@ async function main(): Promise<void> {
   }
   expect("session snapshot follows the rename", snapshotMoved);
 
-  // "d" kills the OTHER profile (A, detached) with everything inside it.
+  // "d" deletes the OTHER profile (A, detached) with everything inside it. This
+  // is the only destructive one: stopping a profile keeps its layout, deleting it
+  // retires the layout to the archive.
   expect("detached profile A still has a snapshot", existsSync(snapshotPath(session)));
   pty2.write(PREFIX);
   await sleep(120);
@@ -1263,7 +1316,7 @@ async function main(): Promise<void> {
   console.log(frame("delete profile confirm", term2));
   expect(
     "delete asks before killing a profile",
-    text3.includes(`Kill "${session}"`) && text3.includes("stopped for good"),
+    text3.includes(`Delete "${session}"`) && text3.includes("layout is archived"),
   );
   pty2.write("y");
   let killedA = false;
@@ -1274,6 +1327,12 @@ async function main(): Promise<void> {
   console.log(frame("after deleting the other profile", term2));
   expect("delete killed profile A's daemon and snapshot", killedA);
   expect("this client stayed in its own profile", !exited2);
+  // ...and the layout it took is recoverable: `gt restore` reads this.
+  expect(
+    "the deleted profile's layout went to the archive",
+    listArchived(session).length > 0,
+    `archive: ${listArchived(session).map((a) => a.path).join(", ") || "empty"}`,
+  );
 
   // Killing the profile you are IN has to move the client somewhere first —
   // otherwise "delete this profile" would drop you out of ghosttown. Make a
@@ -1301,7 +1360,7 @@ async function main(): Promise<void> {
   console.log(frame("delete the profile we are in", term2));
   expect(
     "the confirm says where this client will land",
-    text3.includes(`Kill "${sessionD}"`) && text3.includes("this client moves to"),
+    text3.includes(`Delete "${sessionD}"`) && text3.includes("this client moves to"),
   );
   pty2.write("y");
   let backInC = false;
@@ -1324,18 +1383,77 @@ async function main(): Promise<void> {
   pty2.write("Q");
   await sleep(1500);
   expect("app exited on C-a Q", exited2);
-  expect("profile socket removed on kill", !existsSync(attachSocketC));
-  // Quitting is explicit: nothing to resurrect next time.
-  expect("profile snapshot removed on kill", !existsSync(snapshotPath(sessionC)));
+  expect("profile socket removed on quit", !existsSync(attachSocketC));
+  // A quit ends what is *running*, not the arrangement. The layout stays on
+  // disk and `gt --session <name>` opens it again — it used to be deleted here,
+  // which made every quit a small demolition.
+  expect("quit keeps the session snapshot", existsSync(snapshotPath(sessionC)));
 
   if (!exited2) pty2.kill();
+
+  // --- Reboot (SIGTERM) ----------------------------------------------------
+  // The signal the machine sends every process on its way down. This used to be
+  // read as a deliberate kill, and deliberate kills deleted the snapshot: one
+  // restart wiped the workspace arrangement of every profile at once. It must be
+  // the opposite — the last thing a daemon does is write the layout down.
+  {
+    const term3 = new PersistentTerminal({ cols: COLS, rows: ROWS });
+    term3.feed(LNM_OFF);
+    const pty3 = spawn(
+      process.execPath,
+      ["--conditions=browser", "run", entry, "--session", sessionE],
+      { name: "xterm-256color", cols: COLS, rows: ROWS, cwd: join(import.meta.dir, ".."), env: harnessEnv },
+    );
+    let exited3 = false;
+    pty3.onData((d) => term3.feed(d));
+    pty3.onExit(() => {
+      exited3 = true;
+    });
+    await sleep(5000);
+    // Something worth keeping: a split, so the layout is more than a default.
+    pty3.write(PREFIX);
+    await sleep(120);
+    pty3.write("|");
+    await sleep(1600); // past the layout push + the host's save debounce
+    console.log(frame("profile about to be SIGTERM'd", term3));
+    const before = readSnapshot(sessionE);
+    expect(
+      "the running session wrote a snapshot with both panes",
+      before?.workspaces[0]?.panes.length === 2,
+      `panes: ${before?.workspaces[0]?.panes.length ?? "none"}`,
+    );
+
+    const pid = daemonPid(sessionE);
+    expect("found the daemon to signal", pid > 0);
+    if (pid > 0) process.kill(pid, "SIGTERM");
+    for (let i = 0; i < 20 && daemonPid(sessionE) > 0; i++) await sleep(300);
+    expect("the daemon went down on SIGTERM", daemonPid(sessionE) === 0);
+    expect("its socket went with it", !existsSync(attachSocketE));
+
+    const after = readSnapshot(sessionE);
+    expect("a reboot keeps the snapshot", !!after);
+    expect(
+      "...with the layout intact",
+      after?.workspaces[0]?.panes.length === 2,
+      `panes: ${after?.workspaces[0]?.panes.length ?? "none"}`,
+    );
+    // Nothing was retired or clobbered on the way out, either.
+    expect("nothing was archived by the signal", listArchived(sessionE).length === 0);
+    if (!exited3) pty3.kill();
+  }
   console.log(failures.length === 0 ? "\n[harness] ALL PASS" : `\n[harness] FAILURES: ${failures.length}`);
   process.exit(failures.length === 0 ? 0 : 1);
 }
 
 main().catch(async (err) => {
   console.error("[harness] error:", err);
-  for (const socket of [attachSocket, attachSocketB, attachSocketC, attachSocketD]) {
+  for (const socket of [
+    attachSocket,
+    attachSocketB,
+    attachSocketC,
+    attachSocketD,
+    attachSocketE,
+  ]) {
     await killDaemon(socket);
   }
   if (!exited) pty.kill();

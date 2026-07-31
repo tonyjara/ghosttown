@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { createPtyHost, ReplayBuffer, type Sender } from "./ptyhost";
 import type { HostClientFrame, HostServerFrame } from "../control/protocol";
 import { reloadConfig } from "../core/config";
-import { readSnapshot, SNAPSHOT_VERSION, type PersistedSession } from "../core/persist";
+import {
+  listArchived,
+  readSnapshot,
+  SNAPSHOT_VERSION,
+  type PersistedSession,
+} from "../core/persist";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const decode = (d: string) => Buffer.from(d, "base64").toString("utf8");
@@ -387,7 +392,7 @@ describe("pty host", () => {
     expect(framesOf("boot")[0]!.layout).not.toBeNull();
   });
 
-  it("drops the snapshot and every surface on an explicit quit", async () => {
+  it("kills every surface on a quit but keeps the layout for next time", async () => {
     feed({ t: "hello", persist: true });
     spawnSh("s1");
     feed({ t: "layout", data: layout("s1") });
@@ -395,7 +400,42 @@ describe("pty host", () => {
 
     feed({ t: "quit" });
     expect(host.surfaceCount()).toBe(0);
+    // Quitting ends the processes, not the arrangement: the next cold start
+    // finds the same workspaces and opens fresh shells in them.
+    expect(readSnapshot("test")?.workspaces[0]!.panes[0]!.surfaces[0]!.id).toBe("s1");
+    expect(listArchived("test")).toEqual([]);
+  });
+
+  it("ignores the dying TUI's last frames once the daemon is closing", async () => {
+    // The reboot bug, in miniature. Shutdown flushes the layout and then kills
+    // every surface; the TUI is still up for a moment, sees them all exit, and
+    // walks its close cascade — a shrinking layout, then a quit that means "the
+    // last workspace closed". Both would undo the snapshot we just wrote.
+    feed({ t: "hello", persist: true });
+    spawnSh("s1");
+    feed({ t: "layout", data: layout("s1") });
+    expect(await until(() => !!readSnapshot("test"))).toBe(true);
+
+    host.flushSnapshotSync();
+    host.closeAll();
+    feed({ t: "quit", discard: true });
+    await sleep(900); // past the save debounce, if anything had been scheduled
+
+    expect(readSnapshot("test")?.workspaces[0]!.panes[0]!.surfaces[0]!.id).toBe("s1");
+    expect(listArchived("test")).toEqual([]);
+  });
+
+  it("retires the snapshot on a discarding quit (profile delete)", async () => {
+    feed({ t: "hello", persist: true });
+    spawnSh("s1");
+    feed({ t: "layout", data: layout("s1") });
+    expect(await until(() => !!readSnapshot("test"))).toBe(true);
+
+    feed({ t: "quit", discard: true });
+    expect(host.surfaceCount()).toBe(0);
     expect(readSnapshot("test")).toBeNull();
+    // Retired, not shredded — `gt restore` can undo a mis-aimed confirm.
+    expect(listArchived("test").length).toBe(1);
     received = [];
     feed({ t: "hello", persist: true });
     expect(framesOf("boot")[0]).toEqual({ t: "boot", surfaces: [], layout: null });

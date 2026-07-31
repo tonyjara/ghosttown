@@ -3,6 +3,7 @@
  * This protocol is the stable seam for the phase-2 daemon/client split —
  * keep it additive.
  */
+import { readdirSync } from "node:fs";
 import type { MouseModes } from "../core/mouse";
 import type { PersistedSession } from "../core/persist";
 import type { AgentStatus, SessionSnapshot } from "../core/types";
@@ -89,11 +90,35 @@ export function attachSocketPathFor(session: string): string {
   return `${defaultSocketDir()}/${session}.attach.sock`;
 }
 
+/**
+ * Profiles with a daemon right now — one attach socket each. Only ever *part* of
+ * the profile list: the run dir is under /tmp and does not survive a reboot,
+ * where the saved snapshots do (core/persist listSaved).
+ */
+export function runningSessions(): string[] {
+  try {
+    return readdirSync(defaultSocketDir())
+      .filter((f) => f.endsWith(".attach.sock"))
+      .map((f) => f.slice(0, -".attach.sock".length))
+      .sort();
+  } catch {
+    return []; // run dir may not exist yet
+  }
+}
+
 export type AttachClientFrame =
   | { t: "hello"; cols: number; rows: number }
   | { t: "i"; d: string } // input bytes, base64
   | { t: "r"; cols: number; rows: number }
-  | { t: "cmd"; cmd: "detach" | "kill" }
+  // restart: the daemon goes down (snapshot flushed, NOT dropped) and the
+  // client brings a fresh one up, so the pty host comes back on current source
+  // too. A reload only respawns the TUI.
+  // "kill" stops the session: every surface dies, the sockets go, and the
+  // snapshot is LEFT ALONE — a stopped profile is still a saved profile, and
+  // `gt --session <name>` brings its layout back. "delete" is the destructive
+  // one (the switcher's d): same teardown, and the snapshot is retired to the
+  // archive on the way out.
+  | { t: "cmd"; cmd: "detach" | "kill" | "restart" | "delete" }
   // Profile switch: drop the clients and tell them where to reattach.
   // This session keeps running detached, like "detach" — only the clients move.
   | { t: "cmd"; cmd: "switch"; session: string }
@@ -103,7 +128,9 @@ export type AttachClientFrame =
 
 export type AttachDaemonFrame =
   | { t: "o"; d: string } // output bytes, base64
-  | { t: "bye"; reason: "detached" | "exit" | "killed" }
+  // "restart": reattach to this same session once we are gone — the client
+  // waits for the socket to disappear and starts the replacement daemon.
+  | { t: "bye"; reason: "detached" | "exit" | "killed" | "restart" }
   // The client should reconnect to `session` (starting its daemon if needed).
   | { t: "bye"; reason: "switch"; session: string };
 
@@ -173,8 +200,12 @@ export type HostClientFrame =
   | { t: "cpr"; id: string; seq: number; x: number; y: number }
   /** Layout structure to persist (the host fills in the cwds). */
   | { t: "layout"; data: PersistedSession }
-  /** Explicit quit: kill every surface and drop the snapshot. */
-  | { t: "quit" };
+  /**
+   * Explicit quit: kill every surface. The layout is flushed and kept, so the
+   * next `gt` restores it — quitting ends the processes, not the arrangement.
+   * `discard` is the profile-delete path: retire the snapshot instead.
+   */
+  | { t: "quit"; discard?: boolean };
 
 export type HostServerFrame =
   | { t: "boot"; surfaces: HostSurfaceInfo[]; layout: PersistedSession | null }

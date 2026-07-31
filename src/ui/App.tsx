@@ -44,6 +44,7 @@ import {
   quit,
   reloadApp,
   resizeFocused,
+  restartApp,
   selectTab,
   setArea,
   setHelpVisible,
@@ -145,6 +146,9 @@ function runAction(action: Action): void {
       return;
     case "reload":
       reloadApp();
+      return;
+    case "restart":
+      restartApp();
       return;
     case "quit":
       quit();

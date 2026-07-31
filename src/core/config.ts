@@ -70,6 +70,7 @@ export const ACTIONS = [
   "find-agent",
   "detach",
   "reload",
+  "restart",
   "quit",
   "help",
 ] as const;
@@ -104,6 +105,7 @@ export const ACTION_LABELS: Record<Action, string> = {
   "find-agent": "find agent (fuzzy jump)",
   detach: "detach (keeps running)",
   reload: "reload ghosttown (dev)",
+  restart: "restart incl. daemon (kills panes)",
   quit: "kill ghosttown entirely",
   help: "toggle this help",
 };
@@ -300,6 +302,7 @@ const ACTION_CATEGORIES: Record<Action, HelpCategory> = {
   "find-agent": "Agents",
   detach: "Other",
   reload: "Other",
+  restart: "Other",
   quit: "Other",
   help: "Other",
 };

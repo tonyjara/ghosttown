@@ -17,15 +17,19 @@ shell = ""
 # Session name when `gt` is started without --session.
 session = "main"
 # Keep a layout snapshot (workspaces, splits, tabs, each surface's directory)
-# and rebuild from it when a session starts cold — after a crash or a reboot.
-# Restored surfaces are fresh shells in their old directory; programs that were
-# running are not restarted. `prefix Q` drops the snapshot, so an explicit quit
-# always starts clean. Snapshots live in $XDG_STATE_HOME/ghosttown
-# (~/.local/state/ghosttown).
+# and rebuild from it when a session starts cold — after a quit, a crash or a
+# reboot. Restored surfaces are fresh shells in their old directory; programs
+# that were running are not restarted. Snapshots live in
+# $XDG_STATE_HOME/ghosttown (~/.local/state/ghosttown).
+#
+# Ending a session never throws its layout away: `prefix Q` and a profile *kill*
+# both write it down on the way out, and `gt --session <name>` opens it again.
+# Only deleting a profile retires its layout, and even that moves the file to
+# `archive/` — see `gt profiles -a` and `gt restore <profile>`.
 #
 # This does not apply to a reload (prefix R): the surfaces belong to the
 # background daemon, so they are still running and get adopted as they are,
-# whatever this is set to.
+# whatever this is set to. Set false to always start with one empty workspace.
 restore_session = true
 
 [appearance]
@@ -180,6 +184,15 @@ prefix = "ctrl+a"
 # the TUI — so this costs a repaint and nothing else. (While developing,
 # GHOSTTOWN_DEV=1 does the same thing automatically on every file save.)
 "reload" = ["R"]
+# Reboot: a reload PLUS a fresh daemon, so the pty host comes back on current
+# source too. A reload can't do that — it respawns the TUI, and the daemon it
+# talks to keeps running whatever code it started with, so an edit under
+# src/attach/ptyhost.ts stays invisible until this runs.
+# Everything in the panes DIES: the PTYs are the daemon's, and there is no way
+# to hand a live one to its replacement. The session itself comes back — the
+# snapshot is flushed on the way out and restored on the way in, so workspaces,
+# panes, tabs, their names and their directories all return, with fresh shells.
+"restart" = ["B"]
 # Kill ghosttown completely: every tab, workspace, client, and the daemon.
 "quit" = ["Q"]
 "help" = ["?"]

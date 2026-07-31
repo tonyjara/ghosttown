@@ -9,6 +9,13 @@
  * under GHOSTTOWN_DEV=1 — and the shells and agents in the panes keep running,
  * to be adopted again by the TUI that comes back up.
  *
+ * The flip side is that OUR own code can only change by dying: a running
+ * daemon keeps the pty host it booted with. `cmd:"restart"` is that, made
+ * deliberate — we flush the snapshot and exit, the client starts a replacement,
+ * and the session is rebuilt from the snapshot with fresh shells. The PTYs
+ * cannot come along (bun-pty hands out an opaque handle, never the master fd,
+ * so there is nothing to pass to a successor).
+ *
  * Deliberately lean: no solid/opentui imports — the TUI child does the UI.
  */
 import { spawn, type IPty } from "bun-pty";
@@ -25,7 +32,6 @@ import {
   type AttachDaemonFrame,
 } from "../control/protocol";
 import { SocketWriter } from "../control/sockbuf";
-import { deleteSnapshot } from "../core/persist";
 import { createPtyHost, listenPtyHost } from "./ptyhost";
 
 export interface DaemonOpts {
@@ -37,6 +43,14 @@ export interface DaemonOpts {
 }
 
 type Sock = { data: ClientState; end(): void };
+
+/**
+ * Why the daemon is going down. All of them flush the session snapshot and keep
+ * it — including "killed", which stops the processes and nothing else — except
+ * "delete", the switcher's `d`, which retires the layout to the archive.
+ * "signal" is a SIGTERM: a shutdown, a `kill`, or the machine rebooting.
+ */
+type ShutdownReason = "exit" | "killed" | "restart" | "signal" | "delete";
 
 interface ClientState {
   /** Partial inbound line, waiting for its newline. */
@@ -200,20 +214,25 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
     log("renamed", prev, "→", next);
   };
 
-  const shutdown = (reason: "exit" | "killed"): void => {
+  const shutdown = (reason: ShutdownReason): void => {
     if (shuttingDown) return;
     shuttingDown = true;
     log("shutdown", reason);
-    // A kill is deliberate, so the session shouldn't come back on the next
-    // start. The TUI does the same on prefix+Q, but a killed TUI never gets
-    // to run its handler — and a daemon *crash* must leave the snapshot
-    // alone, which is exactly why this lives here and not in the signal path.
-    if (reason === "killed") deleteSnapshot(session);
+    // Only an explicit profile *delete* retires the layout. Everything else —
+    // a kill, a signal, a crash, a reboot — ends the processes and leaves the
+    // snapshot where it is, because a stopped session is still a saved one.
+    if (reason === "delete") host.discardSnapshot();
     // A TUI that exited on its own may have moved things since the last
-    // 30s heartbeat; catch up before the pids are gone.
-    else host.flushSnapshotSync();
+    // 30s heartbeat; catch up before the pids are gone. A restart depends on
+    // this even more than an exit does: the snapshot IS the handover to the
+    // daemon that replaces us, and it is read while the pids are still alive
+    // (that is where each surface's live cwd comes from). Under a signal the
+    // OS is already timing us out, so skip the lsof and write what we have.
+    else host.flushSnapshotSync(reason !== "signal");
     host.closeAll();
-    broadcast({ t: "bye", reason });
+    // The clients only care about where to go next; a signal or a delete is a
+    // teardown like any other kill as far as they are concerned.
+    broadcast({ t: "bye", reason: reason === "signal" || reason === "delete" ? "killed" : reason });
     setTimeout(() => {
       for (const c of clients) {
         try {
@@ -280,9 +299,27 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
   };
   spawnTui();
 
-  process.on("SIGTERM", () => shutdown("killed"));
+  // A reboot is a SIGTERM to every process on the machine, and macOS gives you
+  // a couple of seconds before SIGKILL. This used to be treated as a deliberate
+  // kill and *deleted* the snapshot, so restarting the computer wiped every
+  // workspace arrangement in every profile. It is now the opposite: the last
+  // thing the daemon does is write the layout down.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGQUIT"] as const) {
+    process.on(sig, () => shutdown("signal"));
+  }
   process.on("SIGHUP", () => {
     // Survive terminal hangups — backgrounding is the whole point.
+  });
+  // Last resort for the paths no handler above covers (an uncaught throw, or a
+  // SIGKILL'd TUI taking us with it): a snapshot write is idempotent, and the
+  // guard means the normal shutdowns don't do it twice.
+  process.on("exit", () => {
+    if (shuttingDown) return;
+    try {
+      host.flushSnapshotSync(false);
+    } catch {
+      // going down anyway
+    }
   });
 
   Bun.listen<ClientState>({
@@ -363,7 +400,19 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
             } else if (frame.cmd === "rename") {
               renameSession(frame.session);
             } else if (frame.cmd === "kill") {
+              // Stop everything running in here. The layout stays on disk:
+              // `gt --session <name>` brings this profile back as it was.
               shutdown("killed");
+            } else if (frame.cmd === "delete") {
+              // The destructive one: the profile itself is going away, so the
+              // snapshot is retired to the archive (recoverable, not gone).
+              shutdown("delete");
+            } else if (frame.cmd === "restart") {
+              // Same teardown as a clean exit — the snapshot is kept, so the
+              // daemon the client starts next restores the session. What dies
+              // is everything in the panes: the surface PTYs are ours.
+              log("restart requested");
+              shutdown("restart");
             }
           }
         }
