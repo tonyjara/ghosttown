@@ -70,6 +70,15 @@ export interface PersistedSession {
   savedAt: number;
   activeWorkspaceId: string;
   sidebarVisible: boolean;
+  /**
+   * Sidebar agent order, by surface id — only the rows shift+J/K moved. Optional
+   * on purpose, so it needs no version bump: an older file simply has none, and
+   * an older daemon writing this one back drops it. Surface ids survive a reload
+   * (the host still owns those ptys) but not a cold start, where every surface is
+   * respawned — so this is a reload-scoped nicety, and stale ids are pruned on
+   * the next write.
+   */
+  agentOrder?: string[];
   workspaces: PersistedWorkspace[];
 }
 

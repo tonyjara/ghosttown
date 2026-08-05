@@ -74,8 +74,9 @@ path. Full table, plus the finders and the sidebar:
   pane is one unit of work with everything that job needs behind it.
 - **Agents found, not announced.** The daemon walks each pane's process tree, so
   a `claude` sitting idle at its prompt is listed the moment it starts — no
-  hooks, no setup. The sidebar is an inbox: blocked first, then done, running,
-  idle, across every workspace.
+  hooks, no setup. Every agent in the profile, across every workspace, each with
+  a live line of what it is working on and a glyph that pulses while it thinks.
+  Rows hold still — they sit where they sit, and `shift+J`/`shift+K` sorts them.
 - **Status you can trust.** Explicit reports from Claude Code hooks
   (`gt hooks setup`) are authoritative; output heuristics are the fallback.
   `blocked` never comes from scraping spinner text.

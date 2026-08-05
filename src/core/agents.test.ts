@@ -7,13 +7,16 @@ import { describe, expect, it } from "bun:test";
 import { loadConfig, setConfigForTest } from "./config";
 import {
   activeSurfaceId,
+  agentContext,
   agentCounts,
   agentEntries,
+  agentSurfaces,
   createWorkspace,
   focusedPaneId,
   hostEvents,
   newTab,
   setStore,
+  sidebarDrag,
   store,
 } from "./state";
 import type { AgentStatus } from "./types";
@@ -138,28 +141,89 @@ describe("agentEntries", () => {
     expect(idsIn(first, second).sort()).toEqual([first, second].sort());
   });
 
-  it("orders by what needs you: blocked, done, working, then idle", () => {
-    const idle = surface("o-idle", { agent: "claude" });
-    const working = surface("o-working", { agent: "claude", status: "working" });
-    const blocked = surface("o-blocked", { agent: "claude", status: "blocked" });
-    const done = surface("o-done", { agent: "claude", status: "done" });
-    expect(idsIn(idle, working, blocked, done)).toEqual([blocked, done, working, idle]);
+  /**
+   * Rows hold still. The list used to rank itself by status (blocked, done,
+   * working, idle, most recent first), which meant acting on a row moved it: you
+   * clicked a finished agent, that made it idle, and it dropped to the bottom
+   * under the pointer. Order is now *where the agent is*, and only shift+J/K
+   * changes it.
+   */
+  it("keeps its order when status changes underneath it", () => {
+    const first = surface("o-first", { agent: "claude" });
+    const second = surface("o-second", { agent: "claude" });
+    const third = surface("o-third", { agent: "claude" });
+    expect(idsIn(first, second, third)).toEqual([first, second, third]);
+
+    for (const [id, status] of [
+      [third, "blocked"],
+      [second, "done"],
+      [first, "working"],
+    ] as const) {
+      setStore("surfaces", id, "status", status);
+      setStore("surfaces", id, "lastActiveAt", Date.now() + 10_000);
+    }
+    expect(idsIn(first, second, third)).toEqual([first, second, third]);
   });
 
-  it("puts a live agent ahead of one that has been quit, however recent", () => {
-    const stale = surface("s-stale", { agent: "claude" });
-    host.onAgent(stale, null);
-    const live = surface("s-live", { agent: "claude" });
-    setStore("surfaces", stale, "lastActiveAt", Date.now() + 10_000); // more recent
-    // A quit agent is only in the list at all under keep_exited; that is where
-    // the live-first tiebreak matters.
-    const config = loadConfig();
-    setConfigForTest({ ...config, agents: { ...config.agents, keep_exited: true } });
-    try {
-      expect(idsIn(stale, live)).toEqual([live, stale]);
-    } finally {
-      setConfigForTest(null);
-    }
+  it("follows the workspaces: an agent sits where its workspace does", () => {
+    const a = surface("o-ws-a", { agent: "claude" });
+    const b = surface("o-ws-b", { agent: "claude" });
+    expect(idsIn(a, b)).toEqual([a, b]);
+    // Dragging the *workspace* up in the sidebar carries its agent with it —
+    // there is one arrangement, and the agents list reads it rather than
+    // keeping a second opinion.
+    const order = [...store.workspaceOrder];
+    const at = order.indexOf(entriesFor(b)[0]!.workspaceId);
+    setStore("workspaceOrder", [
+      ...order.slice(0, at - 1),
+      order[at]!,
+      order[at - 1]!,
+      ...order.slice(at + 1),
+    ]);
+    expect(idsIn(a, b)).toEqual([b, a]);
+  });
+
+  it("puts an agent where shift+J/K dragged it, and leaves new ones at the end", () => {
+    const top = surface("d-top", { agent: "claude" });
+    const bottom = surface("d-bottom", { agent: "claude" });
+    // The drag acts on the sidebar's selection, so point it at `top` first.
+    setStore("sidebar", "section", "agents");
+    setStore("sidebar", "agentIdx", agentSurfaces().findIndex((m) => m.id === top));
+    sidebarDrag(1);
+    expect(idsIn(top, bottom)).toEqual([bottom, top]);
+    expect(store.sidebar.agentIdx).toBe(agentSurfaces().findIndex((m) => m.id === top));
+
+    // A drag pins every row it names; an agent that appears afterwards has no
+    // place of its own yet, so it lands at the end rather than shoving the
+    // arrangement around.
+    const fresh = surface("d-fresh", { agent: "claude" });
+    expect(idsIn(top, bottom, fresh)).toEqual([bottom, top, fresh]);
+  });
+
+  it("stops at the ends instead of wrapping", () => {
+    const only = surface("d-only", { agent: "claude" });
+    setStore("sidebar", "section", "agents");
+    const at = () => agentSurfaces().findIndex((m) => m.id === only);
+    setStore("sidebar", "agentIdx", at());
+    const was = at();
+    sidebarDrag(1); // already last: the list is unchanged
+    expect(at()).toBe(was);
+  });
+});
+
+describe("agentContext", () => {
+  it("strips the agent's own spinner from the front of its title", () => {
+    // What claude actually sets: its status glyph, then the turn's summary. The
+    // glyph is what our own status column says, and while it works that
+    // character is a braille frame changing ten times a second.
+    const meta = store.surfaces[surface("ctx", { agent: "claude" })]!;
+    setStore("surfaces", meta.id, "title", "✳ Merge twonary_mercado changes");
+    expect(agentContext(store.surfaces[meta.id]!)).toBe("Merge twonary_mercado changes");
+    setStore("surfaces", meta.id, "title", "⠐ Test OOS cancel sequence");
+    expect(agentContext(store.surfaces[meta.id]!)).toBe("Test OOS cancel sequence");
+    // A path is not decoration: a title that starts with punctuation keeps it.
+    setStore("surfaces", meta.id, "title", "~/Desktop/Nyto/ghosttown");
+    expect(agentContext(store.surfaces[meta.id]!)).toBe("~/Desktop/Nyto/ghosttown");
   });
 });
 

@@ -172,6 +172,13 @@ interface StoreShape {
   helpVisible: boolean;
   sidebar: SidebarState;
   dialog: DialogState | null;
+  /**
+   * Manual order for the agents list, by surface id — what shift+J/K writes.
+   * Empty means "follow the layout", which is where every profile starts; see
+   * agentSort(). Persisted with the layout, so a drag outlives a reload the way
+   * a workspace drag does.
+   */
+  agentOrder: string[];
 }
 
 let idCounter = 0;
@@ -202,6 +209,7 @@ export const [store, setStore] = createStore<StoreShape>({
     agentIdx: 0,
   },
   dialog: null,
+  agentOrder: [],
 });
 
 let socketPath = "";
@@ -333,6 +341,17 @@ export function agentLabel(meta: SurfaceMeta): string {
   return label.toLowerCase().includes(meta.agent) ? label : meta.agent;
 }
 
+/**
+ * Agents lead their own title with their own status glyph — claude sets
+ * `✳ Merge twonary_mercado changes` sitting idle and spins a braille frame
+ * there while it works. That glyph is the one part of the title we already say
+ * better ourselves, and a frame that changes ten times a second is the last
+ * thing a context line should be doing, so it comes off.
+ */
+export function agentContext(meta: SurfaceMeta): string {
+  return meta.title.replace(/^(?:[\p{So}\p{Sk}]+\s*)+/u, "").trim();
+}
+
 /** Surface id → the pane and workspace holding it, for the whole profile. */
 function surfaceHomes(): Map<string, { paneId: string; workspaceId: string }> {
   const out = new Map<string, { paneId: string; workspaceId: string }>();
@@ -381,19 +400,36 @@ function isAgentSurface(m: SurfaceMeta): boolean {
 }
 
 /**
- * Inbox order: what needs you, then what just finished, then what is running,
- * then what is waiting. Live agents outrank ones that have exited, and ties go
- * to whatever was active most recently.
+ * Row order is *where the agent is*: workspace order, then pane, then tab —
+ * which is the order surfaceHomes() already walks. Status used to sort this list
+ * (blocked, done, working, idle, most recent first), and it read well until you
+ * used it: acting on a row is what changes its status, so the row you just
+ * clicked jumped somewhere else under the pointer. A list you can point at is
+ * worth more than a list that ranks itself.
+ *
+ * `store.agentOrder` is the manual override shift+J/K writes — the same drag the
+ * workspaces have. It names the rows it moved; anything it does not name (a new
+ * agent, or one whose slot predates the drag) keeps its place in the layout,
+ * after the ones it does.
  */
-const STATUS_RANK: Record<AgentStatus, number> = { blocked: 0, done: 1, working: 2, idle: 3 };
-
-function compareAgents(a: AgentEntry, b: AgentEntry): number {
-  const byStatus = STATUS_RANK[a.meta.status] - STATUS_RANK[b.meta.status];
-  if (byStatus !== 0) return byStatus;
-  if (a.live !== b.live) return a.live ? -1 : 1;
-  const byRecency = (b.meta.lastActiveAt ?? 0) - (a.meta.lastActiveAt ?? 0);
-  if (byRecency !== 0) return byRecency;
-  return a.meta.id.localeCompare(b.meta.id);
+function agentSort(order: string[], homes: Map<string, unknown>): (a: AgentEntry, b: AgentEntry) => number {
+  const rank = new Map<string, number>();
+  order.forEach((id, i) => rank.set(id, i));
+  const layout = new Map<string, number>();
+  let n = 0;
+  for (const id of homes.keys()) layout.set(id, n++);
+  // Dragged rows first, in their dragged order; then the layout's own order.
+  // A surface with no home at all (mid-teardown) sorts last, stably by id.
+  const key = (e: AgentEntry): [number, number, string] => [
+    rank.has(e.meta.id) ? 0 : 1,
+    rank.get(e.meta.id) ?? layout.get(e.meta.id) ?? Number.MAX_SAFE_INTEGER,
+    e.meta.id,
+  ];
+  return (a, b) => {
+    const [ga, ia, ka] = key(a);
+    const [gb, ib, kb] = key(b);
+    return ga - gb || ia - ib || ka.localeCompare(kb);
+  };
 }
 
 /**
@@ -415,7 +451,7 @@ export function agentEntries(): AgentEntry[] {
         live: !!meta.agent,
       };
     })
-    .sort(compareAgents);
+    .sort(agentSort(store.agentOrder, homes));
 }
 
 /** The same list, metadata only — what most callers want. */
@@ -813,6 +849,9 @@ function serializeSession(): PersistedSession {
     savedAt: Date.now(),
     activeWorkspaceId: store.activeWorkspaceId,
     sidebarVisible: store.sidebar.visible,
+    // Written out pruned: a surface that is gone is never coming back under the
+    // same id, so its slot is dead weight in the file and in every sort.
+    agentOrder: store.agentOrder.filter((id) => !!store.surfaces[id]),
     workspaces: store.workspaceOrder.map((wsId) => {
       const ws = store.workspaces[wsId]!;
       const paneIds = ws.layout ? collectPaneIds(ws.layout) : [];
@@ -915,6 +954,9 @@ function restoreSession(snap: PersistedSession, live: Map<string, HostSurfaceInf
       }
       s.activeWorkspaceId = activeId;
       s.sidebar.visible = snap.sidebarVisible;
+      // Ids of surfaces this restore is about to adopt; the ones it respawns
+      // instead get fresh ids and drop out of the order on the next write.
+      s.agentOrder = snap.agentOrder ?? [];
     }),
   );
 
@@ -1615,15 +1657,15 @@ export function sidebarMove(delta: 1 | -1): void {
 }
 
 /**
- * Shift+j/k: drag the selected workspace down/up the order, the selection
- * riding along with it. Only the workspaces half is orderable — the agents
- * list is derived and sorted by status, so there is nothing to drag there.
- * Deliberately does not wrap: at the ends you feel the edge instead of the
- * row leaping to the far side of the list.
+ * Shift+j/k: drag the selected row down/up its own half, the selection riding
+ * along with it. Both halves are orderable, by the same keys — the agents list
+ * follows the layout until you move something in it, and from then on it is
+ * yours (see agentSort). Deliberately does not wrap: at the ends you feel the
+ * edge instead of the row leaping to the far side of the list.
  */
-export function sidebarDragWorkspace(delta: 1 | -1): void {
+export function sidebarDrag(delta: 1 | -1): void {
   const sb = store.sidebar;
-  if (sb.section !== "workspaces") return;
+  if (sb.section === "agents") return dragAgent(delta);
   const from = sb.workspaceIdx;
   const wsId = store.workspaceOrder[from];
   const to = from + delta;
@@ -1636,6 +1678,29 @@ export function sidebarDragWorkspace(delta: 1 | -1): void {
     }),
   );
   // The order is the snapshot's order, so a drag outlives a reload.
+  pushLayout();
+}
+
+/**
+ * The agents half has no list of its own to splice — the rows are derived — so a
+ * drag writes the whole current order out as the manual one. That is also what
+ * makes the first drag stick: from then on every row named is pinned where it
+ * was, and only genuinely new agents fall to the bottom.
+ */
+function dragAgent(delta: 1 | -1): void {
+  const ids = agentSurfaces().map((m) => m.id);
+  const from = store.sidebar.agentIdx;
+  const to = from + delta;
+  const id = ids[from];
+  if (!id || to < 0 || to >= ids.length) return;
+  ids.splice(from, 1);
+  ids.splice(to, 0, id);
+  setStore(
+    produce((s) => {
+      s.agentOrder = ids;
+      s.sidebar.agentIdx = to;
+    }),
+  );
   pushLayout();
 }
 

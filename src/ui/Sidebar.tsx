@@ -2,6 +2,7 @@ import { For, Show, createMemo } from "solid-js";
 import type { MouseEvent } from "@opentui/core";
 import {
   activeSurfaceId,
+  agentContext,
   agentCounts,
   agentEntries,
   agentLabel,
@@ -17,14 +18,18 @@ import { truncate, twoColumnRow, windowStart } from "./list";
 import { workingPulse } from "./spinner";
 import { agentGlyph, statusGlyph, theme } from "./theme";
 
-/** Rows the agents half keeps even when there are many workspaces. */
-const MIN_AGENT_ROWS = 4;
+/** Rows the agents half keeps even when there are many workspaces (header + 2). */
+const MIN_AGENT_ROWS = 5;
+
+/** An agent is two rows: who it is, then what it is working on. */
+const AGENT_ROWS = 2;
 
 /**
  * Left sidebar: profile name on top, then two halves — workspaces and every
- * agent in the profile, whichever workspace it lives in, in inbox order
- * (blocked, done, running, idle). Focused via focus-left from the leftmost
- * pane; keys are handled in App and act on core/state.
+ * agent in the profile, whichever workspace it lives in, in the order they sit
+ * in (see agentSort: layout order, or wherever shift+J/K put them). Focused via
+ * focus-left from the leftmost pane; keys are handled in App and act on
+ * core/state.
  *
  * The agents half is the point of the sidebar, so it gets all the room the
  * workspace list does not need.
@@ -65,11 +70,17 @@ export function Sidebar() {
       .map((id, i) => ({ id, idx: start + i }));
   });
 
-  const agentVisibleRows = () => bottomH() - 1;
+  /**
+   * In *agents*, not rows — each one costs AGENT_ROWS of the half's height. Room
+   * for half a row is room for none: on a terminal too short for even one agent
+   * the half keeps its header and stops, rather than drawing a line past its own
+   * box and over a pane.
+   */
+  const agentVisible = () => Math.floor((bottomH() - 1) / AGENT_ROWS);
   const agentWindow = createMemo(() => {
-    const start = windowStart(store.sidebar.agentIdx, agents().length, agentVisibleRows());
+    const start = windowStart(store.sidebar.agentIdx, agents().length, agentVisible());
     return agents()
-      .slice(start, start + agentVisibleRows())
+      .slice(start, start + agentVisible())
       .map((e, i) => ({ e, idx: start + i }));
   });
 
@@ -106,6 +117,23 @@ export function Sidebar() {
     const ws = store.workspaceOrder.length > 1 ? truncate(e.workspace, 12) : "";
     const bar = e.meta.id === here() ? "▌" : " ";
     return twoColumnRow(`${bar}${glyph}${unread}${agentLabel(e.meta)}`, ws ? `${ws} ` : "", width());
+  };
+
+  /**
+   * Second line: what it is working on, which is the tab's own title — the thing
+   * the tab strip shows and the sidebar used to throw away in favor of the bare
+   * agent name. `claude` alone tells you nothing about which of five claudes this
+   * is; "Merge twonary_mercado changes" does.
+   *
+   * Indented to hang under the label, and left blank rather than dropped when
+   * there is nothing to add (a renamed tab whose name IS the title): every agent
+   * costs the same two rows, so the list has one rhythm and the window arithmetic
+   * has one row height.
+   */
+  const agentContextRow = (e: AgentEntry) => {
+    const ctx = agentContext(e.meta);
+    if (!ctx || ctx === agentLabel(e.meta)) return "".padEnd(width());
+    return truncate(`   ${ctx}`, width()).padEnd(width());
   };
 
   /**
@@ -200,13 +228,28 @@ export function Sidebar() {
         >
           <For each={agentWindow()}>
             {(entry) => (
-              <text
-                content={agentRow(entry.e)}
-                fg={agentSelected(entry.idx) ? theme.tabFgActive : agentRowFg(entry.e)}
-                bg={agentRowBg(entry.e, entry.idx)}
-                selectable={false}
+              // Both rows are one target: the click belongs to the agent, not to
+              // whichever of its two lines the pointer happened to land on. The
+              // texts carry no handler, so the press bubbles up to here.
+              <box
+                height={AGENT_ROWS}
+                flexDirection="column"
+                flexShrink={0}
                 onMouseDown={rowClick(() => sidebarClickAgent(entry.e.meta.id))}
-              />
+              >
+                <text
+                  content={agentRow(entry.e)}
+                  fg={agentSelected(entry.idx) ? theme.tabFgActive : agentRowFg(entry.e)}
+                  bg={agentRowBg(entry.e, entry.idx)}
+                  selectable={false}
+                />
+                <text
+                  content={agentContextRow(entry.e)}
+                  fg={agentSelected(entry.idx) ? theme.tabFg : theme.idle}
+                  bg={agentRowBg(entry.e, entry.idx)}
+                  selectable={false}
+                />
+              </box>
             )}
           </For>
         </Show>

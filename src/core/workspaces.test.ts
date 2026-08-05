@@ -8,7 +8,7 @@ import {
   deleteWorkspace,
   lastWorkspace,
   setStore,
-  sidebarDragWorkspace,
+  sidebarDrag,
   store,
   switchWorkspace,
 } from "./state";
@@ -69,7 +69,7 @@ describe("sidebar workspace drag", () => {
     const [a, b, c] = ids as [string, string, string];
     select(b);
 
-    sidebarDragWorkspace(1);
+    sidebarDrag(1);
     expect(tail()).toEqual([a, c, b]);
     // The cursor stays on the row it is dragging, not on the slot it left.
     expect(store.workspaceOrder[store.sidebar.workspaceIdx]).toBe(b);
@@ -80,9 +80,9 @@ describe("sidebar workspace drag", () => {
     const [a, b, c] = ids as [string, string, string];
     select(c);
 
-    sidebarDragWorkspace(-1);
+    sidebarDrag(-1);
     expect(tail()).toEqual([a, c, b]);
-    sidebarDragWorkspace(-1);
+    sidebarDrag(-1);
     expect(tail()).toEqual([c, a, b]);
     expect(store.workspaceOrder[store.sidebar.workspaceIdx]).toBe(c);
   });
@@ -94,11 +94,11 @@ describe("sidebar workspace drag", () => {
 
     // c is the newest, so it is the bottom row of the whole list.
     select(c);
-    sidebarDragWorkspace(1);
+    sidebarDrag(1);
     expect([...store.workspaceOrder]).toEqual(before);
 
     select(store.workspaceOrder[0]!);
-    sidebarDragWorkspace(-1);
+    sidebarDrag(-1);
     expect([...store.workspaceOrder]).toEqual(before);
   });
 
@@ -107,7 +107,7 @@ describe("sidebar workspace drag", () => {
     const before = [...store.workspaceOrder];
     setStore("sidebar", "section", "agents");
 
-    sidebarDragWorkspace(1);
+    sidebarDrag(1);
     expect(store.workspaceOrder).toEqual(before);
     setStore("sidebar", "section", "workspaces");
   });

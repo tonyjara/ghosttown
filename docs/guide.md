@@ -141,7 +141,7 @@ panes. While the sidebar is focused, keys are direct — no prefix:
 | Key | Action |
 |---|---|
 | `j` / `k` | move down / up (flows between the two halves) |
-| `J` / `K` (shift+j / shift+k) | **reorder** — drag the selected workspace down / up |
+| `J` / `K` (shift+j / shift+k) | **reorder** — drag the selected workspace *or agent* down / up |
 | `enter` | open the workspace / jump to the agent |
 | `a` | new workspace (focus follows into its terminal) |
 | `r` | rename the workspace / the selected agent's tab |
@@ -150,16 +150,36 @@ panes. While the sidebar is focused, keys are direct — no prefix:
 ### Sidebar agents
 
 The bottom half lists **every agent in the profile, in every workspace** —
-tagged with the workspace it lives in, in inbox order: `⚑ blocked` first, then
-`✓ done`, `✳ running`, and `○ idle`. It gets all the room the workspace list
-above it does not need, and the header tallies what scrolled out of view.
-`enter` (or a click) jumps straight to one, switching workspace on the way.
+`⚑ blocked`, `✓ done`, `✳ running`, `○ idle`, tagged with the workspace it lives
+in. It gets all the room the workspace list above it does not need, and the
+header tallies what scrolled out of view. `enter` (or a click) jumps straight to
+one, switching workspace on the way.
+
+Each agent takes **two lines**: who it is, then what it is working on — the tab's
+own title, which for a real agent is the turn it is in the middle of
+(`Merge twonary_mercado changes`). The agent's own spinner is stripped off the
+front of it: our status glyph already says that, and better.
+
+```
+▌✳•claude                    Ghosttown
+   Add thinking indicator to agents s…
+ ✓•claude                    T-Runner
+   Test OOS cancel sequence with Esqu…
+```
 
 A **running** agent's glyph pulses — `✢ ✳ ✶ ✻ ✽` and back down — so "still
 thinking" reads off the row without having to remember what it said a second
 ago; a still glyph and a hung agent look the same. It is the only thing in the
 UI that animates, and the clock only runs while something is working, so an
 idle sidebar costs nothing.
+
+**Rows hold still.** The order is where the agent *is* — workspace order, then
+pane, then tab — so the list you learned is the list you keep. It deliberately
+does not rank itself by status: acting on a row is what changes its status, so a
+self-sorting list moves the row you just clicked out from under the pointer.
+`shift+J` / `shift+K` drags a row where you want it, the same keys the
+workspaces use, and that arrangement survives a `prefix R` reload. New agents
+join at the end.
 
 The agent **you are in** is marked like the workspace you are in, but out of the
 way of its status: a `▌` bar down the left of the row and a dimmer highlight

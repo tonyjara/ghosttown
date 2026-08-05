@@ -957,6 +957,37 @@ async function main(): Promise<void> {
     // Any status glyph, pulse frames included — the point is the bar sits
     // *before* the glyph rather than over it.
     expect("the agent you are in is marked in the sidebar", /▌[·○✳✢✶✻✽✓⚑]/.test(term.getText()));
+
+    // The second line of a row is what the agent is working on: the tab's own
+    // OSC title, minus the status glyph the agent leads it with (claude puts a
+    // braille spinner frame there, which would flicker). Set one for real, from
+    // inside the agent's tab, and read it back off the sidebar.
+    pty.write("printf '\\033]2;\\342\\234\\263 Fix the sidebar rows\\007'\r");
+    await settle(/Fix the sidebar rows/);
+    console.log(frame("agent row with its context line"));
+    const lines = term.getText().split("\n");
+    const ctxAt = lines.findIndex((l) => l.includes("Fix the sidebar rows"));
+    expect("an agent row carries a line of what it is working on", ctxAt > 0);
+    const ctxLine = lines[ctxAt] ?? "";
+    // Sidebar rows are (bar)(glyph)(unread)(label), and the context hangs under
+    // the label — so it is indented, and the row above it is the agent itself.
+    expect("...indented under the row it belongs to", /^ {3}Fix the sidebar rows/.test(ctxLine));
+    expect("...with the agent's own spinner glyph stripped off", !ctxLine.includes("✳"));
+    expect("...directly under the agent it describes", (lines[ctxAt - 1] ?? "").includes("claude"));
+
+    // Both lines are one click target. The wrapper box holding them claims the
+    // hit grid (a box does, even empty), so a press on the *context* line has to
+    // reach the same jump the name line does — otherwise it bubbles to the
+    // sidebar and only takes the keys.
+    click(5, 2); // sidebar chrome: hand the keys to the sidebar first
+    await sleep(400);
+    click(5, ctxAt + 1); // getText is 0-indexed, mouse rows are 1-based
+    await sleep(600);
+    pty.write("echo ctx_click\r");
+    await sleep(1000);
+    console.log(frame("after clicking an agent's context line"));
+    expect("clicking the context line jumps into that agent", term.getText().includes("ctx_click"));
+
     pty.write('kill "$AGENT"\r');
     const gone = await settle(/AGENTS \(1\)/);
     console.log(frame("quit agent leaves the list"));

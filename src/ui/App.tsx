@@ -55,7 +55,7 @@ import {
   setPrefixArmed,
   sidebarCreate,
   sidebarDelete,
-  sidebarDragWorkspace,
+  sidebarDrag,
   sidebarEnter,
   sidebarMove,
   sidebarRename,
@@ -273,11 +273,11 @@ function handleSidebarKey(key: KeyEvent): void {
   // as name "j" + shift, sequence "J", and the switch below reads the name
   // alone — so the drag has to be picked off before j/k swallow it.
   if (key.sequence === "J" || (key.shift && key.name === "down")) {
-    sidebarDragWorkspace(1);
+    sidebarDrag(1);
     return;
   }
   if (key.sequence === "K" || (key.shift && key.name === "up")) {
-    sidebarDragWorkspace(-1);
+    sidebarDrag(-1);
     return;
   }
   switch (key.name) {
