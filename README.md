@@ -58,14 +58,15 @@ Prefix is `Ctrl+A`, tmux-style. The essentials:
 | `h j k l` / arrows | focus pane by direction |
 | `T` / `n` / `p` / `1`–`9` | new tab · next · previous · select tab N |
 | `w` / `a` | fuzzy-find a **workspace** / an **agent** |
-| `C` / `N` / `P` | new workspace · next · previous |
+| `C` / `N` / `P` / `z` | new workspace · next · previous · last one you were in |
 | `s` | profiles: switch, add, rename, delete |
 | `d` / `R` / `Q` | detach · reload the TUI · quit everything |
 | `?` | the full list, merged with your config |
 
 Mouse works throughout: click a pane or tab to focus, drag the gap between
-panes to resize, drop a file to type its path. Full table, plus the finders and
-the sidebar: **[docs/guide.md](docs/guide.md)**.
+panes to resize, drag a tab along its strip to sort it, drop a file to type its
+path. Full table, plus the finders and the sidebar:
+**[docs/guide.md](docs/guide.md)**.
 
 ## What you get
 

@@ -1,8 +1,16 @@
-import { For, createSignal } from "solid-js";
-import type { MouseEvent } from "@opentui/core";
-import { closeSurface, focusPane, newTab, selectTab, surfaceLabel } from "../core/state";
+import { For, createSignal, onCleanup } from "solid-js";
+import type { BoxRenderable, MouseEvent } from "@opentui/core";
+import {
+  closeSurface,
+  focusPane,
+  newTab,
+  selectTab,
+  startTabDrag,
+  surfaceLabel,
+} from "../core/state";
 import type { PaneState } from "../core/types";
 import { store } from "../core/state";
+import { registerTabBox, releaseTabBox } from "./tabs";
 import { statusGlyph, theme } from "./theme";
 
 /** How close two presses on `+` have to be to count as a double click. */
@@ -43,7 +51,10 @@ export function TabStrip(props: { pane: PaneState; focused: boolean }) {
             const dot = m.unread ? "●" : "";
             return ` ${idx() + 1}:${surfaceLabel(m).slice(0, 18)}${g ? " " + g : ""}${dot ? " " + dot : ""}`;
           };
-          const bg = () => (active() ? theme.tabBgActive : stripBg());
+          /** Held by the mouse: the strip it is being dragged along says so. */
+          const dragging = () => store.tabDrag?.surfaceId === sid;
+          const bg = () =>
+            dragging() ? theme.sidebarSelBg : active() ? theme.tabBgActive : stripBg();
           /**
            * Closing is one click, on any tab — so it must not also read as
            * "focus this pane" on the way out: the pane may be gone by then
@@ -53,16 +64,33 @@ export function TabStrip(props: { pane: PaneState; focused: boolean }) {
             e.stopPropagation();
             closeSurface(sid);
           };
+          // Where this tab ended up on screen, for hit-testing a drag; the root
+          // handler that sees the pointer cannot ask the strip directly. `For`
+          // is keyed on the surface id, so a reorder moves this box rather than
+          // rebuilding it and the registration survives the drag.
+          let box: BoxRenderable | undefined;
+          onCleanup(() => box && releaseTabBox(sid, box));
           return (
-            <box height={1} flexDirection="row" backgroundColor={bg()} flexShrink={0}>
+            <box
+              ref={(el: BoxRenderable) => registerTabBox(sid, (box = el))}
+              height={1}
+              flexDirection="row"
+              backgroundColor={bg()}
+              flexShrink={0}
+            >
               <text
                 content={label()}
                 fg={active() ? theme.tabFgActive : glyph().glyph ? glyph().color : theme.tabFg}
                 bg={bg()}
                 selectable={false}
+                // A press on a tab both selects it and picks it up: holding it
+                // and moving reorders the strip, letting go of it does nothing
+                // more than the click already did. Only the label starts a
+                // drag — `×` stops propagation, so closing never becomes one.
                 onMouseDown={() => {
                   focusPane(props.pane.id);
                   selectTab(props.pane.id, idx());
+                  startTabDrag(props.pane.id, idx());
                 }}
               />
               {/* Always there, so tabs never shift under the pointer; it lights

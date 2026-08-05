@@ -1,6 +1,7 @@
 import { For, Show, createMemo } from "solid-js";
 import type { MouseEvent } from "@opentui/core";
 import {
+  activeSurfaceId,
   agentCounts,
   agentEntries,
   agentLabel,
@@ -13,6 +14,7 @@ import {
   type AgentEntry,
 } from "../core/state";
 import { truncate, twoColumnRow, windowStart } from "./list";
+import { workingPulse } from "./spinner";
 import { agentGlyph, statusGlyph, theme } from "./theme";
 
 /** Rows the agents half keeps even when there are many workspaces. */
@@ -42,6 +44,14 @@ export function Sidebar() {
   const agents = createMemo(() => agentEntries());
   const counts = createMemo(() => agentCounts());
 
+  /**
+   * The agent you are *in*: the tab the keys go to, which survives focus moving
+   * into the sidebar — you are still "in" that agent while you browse the list.
+   * A plain shell has an id like any other tab, it just matches no row here, so
+   * nothing is marked while you are in one.
+   */
+  const here = () => activeSurfaceId();
+
   const wsSelected = (i: number) =>
     store.sidebar.focused && store.sidebar.section === "workspaces" && i === store.sidebar.workspaceIdx;
   const agentSelected = (i: number) =>
@@ -69,19 +79,33 @@ export function Sidebar() {
   };
 
   /**
-   * ` ✳ claude          FrontendV2` — the status is in the glyph and its color,
+   * `▌✳ claude          FrontendV2` — the status is in the glyph and its color,
    * which leaves the right-hand column for the workspace. That column is what
    * makes the list usable across a profile: without it, five agents called
    * "claude" are indistinguishable.
+   *
+   * The leading bar is the one you are in. It goes in the row's own margin
+   * rather than the marker column, so it costs no width and — unlike the `●` a
+   * workspace gets — never has to compete with the status glyph: "where am I"
+   * and "how is it doing" stay two separate readings of the same row.
+   *
+   * Reactive by being read inside a prop: `workingPulse()` ticks, so the rows
+   * of the agents that are thinking animate and every other row stays put.
    */
   const agentRow = (e: AgentEntry) => {
     // An agent sitting at its prompt (○) and one no process poll can see (·) —
     // a reporter-only tab, or a quit agent under [agents] keep_exited — are both
     // "idle", and the difference is worth one character.
-    const glyph = e.meta.status === "idle" && !e.live ? "·" : agentGlyph(e.meta.status).glyph;
+    const glyph =
+      e.meta.status === "working"
+        ? workingPulse()
+        : e.meta.status === "idle" && !e.live
+          ? "·"
+          : agentGlyph(e.meta.status).glyph;
     const unread = e.meta.unread ? "•" : " ";
     const ws = store.workspaceOrder.length > 1 ? truncate(e.workspace, 12) : "";
-    return twoColumnRow(` ${glyph}${unread}${agentLabel(e.meta)}`, ws ? `${ws} ` : "", width());
+    const bar = e.meta.id === here() ? "▌" : " ";
+    return twoColumnRow(`${bar}${glyph}${unread}${agentLabel(e.meta)}`, ws ? `${ws} ` : "", width());
   };
 
   /**
@@ -92,6 +116,16 @@ export function Sidebar() {
   const agentRowFg = (e: AgentEntry) => {
     if (e.meta.status !== "idle") return agentGlyph(e.meta.status).color;
     return e.live ? theme.tabFg : theme.idle;
+  };
+
+  /**
+   * Highlight, in order: the cursor (only while the sidebar has the keys), then
+   * the agent you are in. Two different questions, so the cursor wins the
+   * background it lands on — the bar in the row still says which one is home.
+   */
+  const agentRowBg = (e: AgentEntry, idx: number) => {
+    if (agentSelected(idx)) return theme.sidebarSelBg;
+    return e.meta.id === here() ? theme.sidebarCurBg : theme.sidebarBg;
   };
 
   /** `AGENTS (5)  ⚑1 ✳2` — the tally covers the ones scrolled out of view. */
@@ -169,7 +203,7 @@ export function Sidebar() {
               <text
                 content={agentRow(entry.e)}
                 fg={agentSelected(entry.idx) ? theme.tabFgActive : agentRowFg(entry.e)}
-                bg={agentSelected(entry.idx) ? theme.sidebarSelBg : theme.sidebarBg}
+                bg={agentRowBg(entry.e, entry.idx)}
                 selectable={false}
                 onMouseDown={rowClick(() => sidebarClickAgent(entry.e.meta.id))}
               />

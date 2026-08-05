@@ -139,7 +139,7 @@ describe("helpSections", () => {
     process.env.GHOSTTOWN_CONFIG = "/nonexistent/nope.toml";
     const sections = helpSections(loadConfig());
     const workspaces = sections.find((s) => s.category === "Workspaces");
-    expect(workspaces?.rows.map((r) => r.keys)).toEqual(["C", "N", "P", "W", "X", "w"]);
+    expect(workspaces?.rows.map((r) => r.keys)).toEqual(["C", "N", "P", "z", "W", "X", "w"]);
     expect(sections.some((s) => s.category === "Agents")).toBe(true);
   });
 });

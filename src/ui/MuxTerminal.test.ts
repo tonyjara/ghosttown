@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { PersistentTerminal } from "ghostty-opentui";
-import { clampScrollUp, LNM_OFF, viewWindow } from "./MuxTerminal";
+import { clampScrollUp, LNM_OFF, selectionFinished, viewWindow } from "./MuxTerminal";
 
 const ROWS = 24;
 const live = (total: number, scrollUp = 0, prevTotal = total) =>
@@ -18,6 +18,24 @@ describe("LNM_OFF", () => {
     // CR+LF and NEL still return to column 0.
     term.feed("\r\nX\x1bE");
     expect(term.getJson({ limit: 1 }).cursor).toEqual([0, 3]);
+  });
+});
+
+describe("selectionFinished", () => {
+  const sel = (isDragging: boolean, isActive = true) => ({ isDragging, isActive });
+
+  it("fires once, on the notification where the drag ends", () => {
+    // Mid-drag: nothing yet, or every step of the drag would copy.
+    expect(selectionFinished(true, sel(true))).toBe(false);
+    // Mouse up.
+    expect(selectionFinished(true, sel(false))).toBe(true);
+    // The same selection, notified again after the drag: already copied.
+    expect(selectionFinished(false, sel(false))).toBe(false);
+  });
+
+  it("ignores a cleared or empty selection", () => {
+    expect(selectionFinished(true, null)).toBe(false);
+    expect(selectionFinished(true, sel(false, false))).toBe(false);
   });
 });
 

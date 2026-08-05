@@ -37,7 +37,13 @@ import {
   writeSnapshot,
   type PersistedSession,
 } from "../core/persist";
-import { DEFAULT_AGENT_COMMANDS, findAgents, readProcTable } from "../core/procs";
+import {
+  DEFAULT_AGENT_COMMANDS,
+  findAgents,
+  readProcTable,
+  readProcTableSync,
+  type ProcTable,
+} from "../core/procs";
 import { cursorReport, OutputScanner } from "../core/queries";
 import { StatusTracker } from "../core/status";
 import type { AgentStatus } from "../core/types";
@@ -54,6 +60,22 @@ const SAVE_DEBOUNCE_MS = 750;
 const SAVE_INTERVAL_MS = 30_000;
 /** How often the process table is walked looking for agents ([agents] poll_ms). */
 const DEFAULT_AGENT_POLL_MS = 2000;
+/**
+ * Closing a pane is a terminal going away, so the program gets SIGHUP first —
+ * exactly what a real one would send it. That is also *all* bun-pty's kill()
+ * sends, and a program that traps or ignores hangups (a graceful-shutdown
+ * handler that never gets around to exiting) would then sit in RAM with every
+ * child it spawned until the machine reboots. So the close escalates: a while
+ * after the hangup, SIGTERM, and then the one nothing survives.
+ *
+ * The first step is deliberately generous — an agent asked to stop is often
+ * mid-write, and the point is to close the tab, not to corrupt what it was
+ * saving.
+ */
+const KILL_LADDER = [
+  { after: 1500, signal: "SIGTERM" },
+  { after: 4000, signal: "SIGKILL" },
+] as const;
 /** A pane can churn, but a poll cheaper than this is just burning CPU. */
 const MIN_AGENT_POLL_MS = 500;
 
@@ -151,6 +173,13 @@ export interface PtyHost {
   setSession(session: string): void;
   /** Kill every surface and stop the timers (daemon shutdown). */
   closeAll(): void;
+  /**
+   * Blocking last pass over the surfaces closeAll hung up on: anything still
+   * running ignored the hangup, and once this process is gone nothing will ever
+   * ask it again. Call it as late in the shutdown as there is time for — that
+   * delay is all the grace a program gets to act on its SIGHUP.
+   */
+  killSurvivors(): void;
   /**
    * Blocking snapshot write, for the way out. `readDirs: false` skips the lsof
    * and writes the directories from the last pass — for the signal path, where
@@ -410,6 +439,19 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
         emit({ t: "title", id: s.id, title: trimmed });
       },
       onNotify: (title, body) => emit({ t: "notify", id: s.id, title, body }),
+      // The copy has to leave the process: a pane's emulator has no clipboard,
+      // and only the TUI's stdout reaches the terminal the user is looking at.
+      //
+      // Agents only (see core/procs DEFAULT_AGENT_COMMANDS). An agent copying is
+      // the user having selected something in it — that is the whole point of
+      // the pane. Everything else keeps stock behaviour: a program that copies
+      // in a plain terminal reaches the clipboard or does not, and neovim, a
+      // shell or a pager is not something this mux should start intercepting
+      // clipboard traffic for.
+      onClipboard: (payload) => {
+        if (!s.agent) return;
+        emit({ t: "clip", id: s.id, d: payload });
+      },
     });
     surfaces.set(s.id, s);
 
@@ -430,6 +472,11 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
       emit({ t: "exit", id: s.id, code: 1 });
       return;
     }
+
+    // The OS recycles pids, so this one may be the pid a surface closed a moment
+    // ago is still on the ladder for. It is a different process now, and must
+    // not inherit that surface's pending SIGKILL.
+    stopEscalation(s.pty.pid);
 
     s.pty.onData((chunk) => {
       // Out to the TUI *before* scanning: frames arrive in order and are fed
@@ -461,15 +508,80 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
     void pollAgents();
   };
 
+  /**
+   * Leader pid → the ladder still pending for it. Keyed by pid because that is
+   * all a closed surface leaves behind, and held so a shutdown (whose timers
+   * will never fire) and a pid the OS hands straight back can both cancel it.
+   */
+  const escalations = new Map<number, Array<ReturnType<typeof setTimeout>>>();
+
+  const stopEscalation = (pid: number): void => {
+    for (const timer of escalations.get(pid) ?? []) clearTimeout(timer);
+    escalations.delete(pid);
+  };
+
+  /**
+   * Keep the groups, drop the waiting: for a shutdown, where the ladder's timers
+   * cannot outlive the process anyway and killSurvivors is what finishes the job.
+   */
+  const holdEscalations = (): void => {
+    for (const [pid, timers] of escalations) {
+      for (const timer of timers) clearTimeout(timer);
+      escalations.set(pid, []);
+    }
+  };
+
+  /**
+   * Signal a closed surface's whole process group. Every pty leader is a session
+   * leader, so its pgid is its own pid, and -pid is what reaches the shell, the
+   * agent under it and whatever tool that agent spawned — killing the leader
+   * alone would leave those behind.
+   *
+   * Nothing is signalled unless the pid is still one of *our* children: pids get
+   * reused, and -pid on a recycled one is some unrelated process group. Returns
+   * whether there was still something there to signal.
+   */
+  const signalGroup = (pid: number, signal: "SIGTERM" | "SIGKILL", table: ProcTable): boolean => {
+    if (table.get(pid)?.ppid !== process.pid) return false;
+    try {
+      process.kill(-pid, signal);
+      return true;
+    } catch {
+      return false; // died between the ps and here
+    }
+  };
+
+  /** Walk KILL_LADDER for a surface that has just been sent its hangup. */
+  const escalate = (pid: number, id: string): void => {
+    stopEscalation(pid);
+    escalations.set(
+      pid,
+      KILL_LADDER.map(({ after, signal }, step) =>
+        setTimeout(() => {
+          void readProcTable().then((table) => {
+            const alive = signalGroup(pid, signal, table);
+            if (alive) log("close ignored, escalated", { id, pid, signal });
+            // Nothing left, or nothing left to try: drop the rest of the ladder.
+            if (!alive || step === KILL_LADDER.length - 1) stopEscalation(pid);
+          });
+        }, after),
+      ),
+    );
+  };
+
   const killSurface = (id: string): void => {
     const s = surfaces.get(id);
     if (!s) return;
     surfaces.delete(id);
+    // Read before the kill: it is the only handle on the process group left once
+    // bun-pty has closed the pty.
+    const pid = s.pty?.pid ?? 0;
     try {
-      s.pty?.kill();
+      s.pty?.kill(); // one SIGHUP, and nothing after it — hence the ladder
     } catch {
       // already dead
     }
+    if (pid > 0) escalate(pid, id);
   };
 
   const tick = setInterval(() => {
@@ -627,7 +739,16 @@ export function createPtyHost(opts: PtyHostOpts): PtyHost {
       for (const { timer } of pendingCpr.values()) clearTimeout(timer);
       pendingCpr.clear();
       for (const id of [...surfaces.keys()]) killSurface(id);
+      holdEscalations();
       client = null;
+    },
+    killSurvivors() {
+      if (escalations.size === 0) return;
+      const table = readProcTableSync();
+      for (const pid of [...escalations.keys()]) {
+        if (signalGroup(pid, "SIGKILL", table)) log("shutdown: killed surviving group", pid);
+        stopEscalation(pid);
+      }
     },
     flushSnapshotSync,
     discardSnapshot,

@@ -33,6 +33,12 @@ export interface Theme {
   idle: string;
   sidebarBg: string;
   sidebarSelBg: string;
+  /**
+   * The row you are *in* (the current agent), as opposed to the row the cursor
+   * is on (sidebarSelBg). Deliberately quieter than that one: it is there all
+   * the time, and it has to leave the status color the loudest thing in a row.
+   */
+  sidebarCurBg: string;
 }
 
 export const THEMES: Record<string, Theme> = {
@@ -54,6 +60,7 @@ export const THEMES: Record<string, Theme> = {
     idle: "#555570",
     sidebarBg: "#13131e",
     sidebarSelBg: "#3d3d66",
+    sidebarCurBg: "#222237",
   },
   "catppuccin-mocha": {
     bg: "#1e1e2e", // base
@@ -73,6 +80,7 @@ export const THEMES: Record<string, Theme> = {
     idle: "#6c7086", // overlay0
     sidebarBg: "#181825",
     sidebarSelBg: "#45475a",
+    sidebarCurBg: "#313244", // surface0
   },
   "catppuccin-latte": {
     bg: "#eff1f5", // base
@@ -92,6 +100,7 @@ export const THEMES: Record<string, Theme> = {
     idle: "#9ca0b0", // overlay0
     sidebarBg: "#e6e9ef",
     sidebarSelBg: "#bcc0cc",
+    sidebarCurBg: "#ccd0da", // surface0
   },
   tokyonight: {
     bg: "#1a1b26",
@@ -111,6 +120,7 @@ export const THEMES: Record<string, Theme> = {
     idle: "#565f89",
     sidebarBg: "#16161e",
     sidebarSelBg: "#3b4261",
+    sidebarCurBg: "#292e42",
   },
   gruvbox: {
     bg: "#282828",
@@ -130,6 +140,7 @@ export const THEMES: Record<string, Theme> = {
     idle: "#928374",
     sidebarBg: "#1d2021",
     sidebarSelBg: "#504945",
+    sidebarCurBg: "#3c3836",
   },
   nord: {
     bg: "#2e3440",
@@ -149,6 +160,7 @@ export const THEMES: Record<string, Theme> = {
     idle: "#616e88",
     sidebarBg: "#292e39",
     sidebarSelBg: "#434c5e",
+    sidebarCurBg: "#3b4252",
   },
   dracula: {
     bg: "#282a36",
@@ -168,5 +180,6 @@ export const THEMES: Record<string, Theme> = {
     idle: "#6272a4",
     sidebarBg: "#21222c",
     sidebarSelBg: "#44475a",
+    sidebarCurBg: "#343746",
   },
 };

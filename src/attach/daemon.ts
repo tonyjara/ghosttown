@@ -45,6 +45,14 @@ export interface DaemonOpts {
 type Sock = { data: ClientState; end(): void };
 
 /**
+ * How long the daemon lingers after its clients are gone, so a pane program has
+ * a moment to act on the hangup before the host makes sure of it (see
+ * PtyHost.killSurvivors). Invisible from the outside: the sockets are already
+ * closed and the shell prompt is already back by then.
+ */
+const SURVIVOR_GRACE_MS = 500;
+
+/**
  * Why the daemon is going down. All of them flush the session snapshot and keep
  * it — including "killed", which stops the processes and nothing else — except
  * "delete", the switcher's `d`, which retires the layout to the archive.
@@ -255,7 +263,14 @@ export async function runDaemon(opts: DaemonOpts): Promise<void> {
           // already removed
         }
       }
-      process.exit(0);
+      // Nobody is attached anymore, so this last wait costs the user nothing:
+      // it is the grace a pane program gets to act on the hangup closeAll sent
+      // before we make sure it is really gone. Surviving this process is how a
+      // program that ignores hangups becomes an orphan nothing ever reaps.
+      setTimeout(() => {
+        host.killSurvivors();
+        process.exit(0);
+      }, SURVIVOR_GRACE_MS);
     }, 100);
   };
 

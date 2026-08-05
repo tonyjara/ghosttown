@@ -119,6 +119,35 @@ describe("pty host", () => {
     });
   };
 
+  /**
+   * A pane program that ignores every polite signal, with a child that does the
+   * same — the shape a graceful-shutdown handler with nothing to hand back has.
+   * `tag` is a sleep duration, which is what makes the four processes it leaves
+   * (two shells, two sleeps) findable in the process table.
+   */
+  const spawnStubborn = (id: string, tag: number): void => {
+    feed({
+      t: "spawn",
+      id,
+      command: "/bin/bash",
+      args: [
+        "-c",
+        `trap '' HUP TERM INT; bash -c "trap '' HUP TERM INT; sleep ${tag + 1}" & sleep ${tag}`,
+      ],
+      cwd: stateDir,
+      env: { TERM: "xterm-256color" },
+      cols: 40,
+      rows: 10,
+    });
+  };
+
+  /** How many of a spawnStubborn tree are still running. */
+  const stubbornProcs = (tag: number): number =>
+    Bun.spawnSync(["ps", "-Ao", "pid=,args="])
+      .stdout.toString()
+      .split("\n")
+      .filter((l) => l.includes(`sleep ${tag}`) || l.includes(`sleep ${tag + 1}`)).length;
+
   it("boots empty, then reports what it is running", async () => {
     feed({ t: "hello", persist: false });
     expect(framesOf("boot")[0]).toEqual({ t: "boot", surfaces: [], layout: null });
@@ -404,6 +433,35 @@ describe("pty host", () => {
     // finds the same workspaces and opens fresh shells in them.
     expect(readSnapshot("test")?.workspaces[0]!.panes[0]!.surfaces[0]!.id).toBe("s1");
     expect(listArchived("test")).toEqual([]);
+  });
+
+  it("escalates a close that the program ignores, taking its children with it", async () => {
+    feed({ t: "hello", persist: false });
+    spawnStubborn("s1", 61230);
+    expect(await until(() => stubbornProcs(61230) === 4)).toBe(true);
+
+    feed({ t: "kill", id: "s1" });
+    // The hangup lands and is ignored — nothing exits on it.
+    await sleep(400);
+    expect(stubbornProcs(61230)).toBe(4);
+    // ...so the ladder runs, and the last rung is one nothing survives. The
+    // whole group goes, not just the pty's own process.
+    expect(await until(() => stubbornProcs(61230) === 0, 8000)).toBe(true);
+  });
+
+  it("makes sure of the survivors on the way out, since no timer outlives us", async () => {
+    feed({ t: "hello", persist: false });
+    spawnStubborn("s2", 61240);
+    expect(await until(() => stubbornProcs(61240) === 4)).toBe(true);
+
+    // A shutdown hangs every surface up and then has ~nothing to spare: the
+    // daemon is about to exit, so the ladder's timers will never fire.
+    host.closeAll();
+    await sleep(300);
+    expect(stubbornProcs(61240)).toBe(4);
+
+    host.killSurvivors();
+    expect(await until(() => stubbornProcs(61240) === 0)).toBe(true);
   });
 
   it("ignores the dying TUI's last frames once the daemon is closing", async () => {

@@ -2,7 +2,7 @@ import { createEffect, onCleanup, onMount } from "solid-js";
 import { useRenderer } from "@opentui/solid";
 import type { BoxRenderable, RenderContext } from "@opentui/core";
 import { MOUSE_MODES_OFF } from "../core/mouse";
-import { dividerDragging, registry } from "../core/state";
+import { mouseGrabbed, registry, store } from "../core/state";
 import { MuxTerminal } from "./MuxTerminal";
 
 /**
@@ -41,9 +41,13 @@ export function TerminalSurface(props: {
     term.attachMouse({
       modes: () => rt?.mouseModes() ?? MOUSE_MODES_OFF,
       report: (data) => rt?.reportMouse(data),
-      // A divider drag crossing this pane is not input for it.
-      grabbed: dividerDragging,
+      // A divider or tab drag crossing this pane is not input for it.
+      grabbed: mouseGrabbed,
     });
+    // Copy on select is an agent-pane affordance: shells, editors and pagers are
+    // left exactly as they were. Read at release time, because what runs in a
+    // surface changes under it.
+    term.setCopyOnSelect(() => !!store.surfaces[props.sid]?.agent);
   });
 
   createEffect(() => {

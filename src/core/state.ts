@@ -23,6 +23,7 @@ import {
   socketPathFor,
   type HostSurfaceInfo,
 } from "../control/protocol";
+import { osc52, relayToHostTerminal } from "./clipboard";
 import { loadConfig, setConfigForTest } from "./config";
 import { dbg } from "./debug";
 import { fuzzyFilter } from "./fuzzy";
@@ -139,13 +140,19 @@ interface StoreShape {
   workspaces: Record<string, WorkspaceState>;
   workspaceOrder: string[];
   activeWorkspaceId: string;
+  /** The workspace we came from, for the back-and-forth jump (prefix+z). */
+  lastWorkspaceId: string;
   panes: Record<string, PaneState>;
   surfaces: Record<string, SurfaceMeta>;
   /** Full terminal size; pane area is derived via paneArea(). */
   screen: { width: number; height: number };
   prefixArmed: boolean;
-  /** Prefix+r toggles this; h/j/k/l then move dividers until esc/enter. */
-  resizeMode: boolean;
+  /**
+   * Prefix+r toggles this: h/j/k/l then move dividers and H/L move the focused
+   * tab along its strip, until esc/enter. One mode for "arrange what is already
+   * open" — sizes and tab order — rather than a mode per axis.
+   */
+  arrangeMode: boolean;
   /**
    * The divider a mouse drag is moving right now. It lives here rather than in
    * the component because the panes have to know: while a drag is running the
@@ -153,6 +160,15 @@ interface StoreShape {
    * the events to its program.
    */
   dividerDrag: Gutter | null;
+  /**
+   * The tab a mouse drag is carrying, same reasoning as `dividerDrag`: the
+   * strip that owns it draws it as picked up, and the panes have to know the
+   * mouse is spoken for. Reordering happens live as the pointer moves, so there
+   * is nothing to commit on release. The tab is named, never indexed — its slot
+   * changes with every step of the drag, and anything else can close a tab
+   * while one is running.
+   */
+  tabDrag: { paneId: string; surfaceId: string } | null;
   helpVisible: boolean;
   sidebar: SidebarState;
   dialog: DialogState | null;
@@ -169,12 +185,14 @@ export const [store, setStore] = createStore<StoreShape>({
   workspaces: {},
   workspaceOrder: [],
   activeWorkspaceId: "",
+  lastWorkspaceId: "",
   panes: {},
   surfaces: {},
   screen: { width: 80, height: 24 },
   prefixArmed: false,
-  resizeMode: false,
+  arrangeMode: false,
   dividerDrag: null,
+  tabDrag: null,
   helpVisible: false,
   sidebar: {
     visible: true,
@@ -448,6 +466,25 @@ function isVisibleActive(surfaceId: string): boolean {
 }
 
 /**
+ * Whether a status change is worth a desktop notification.
+ *
+ * A status is *derived* — from hooks, or from output going quiet — and quiet
+ * means something different in every kind of tab. In an agent it is a turn that
+ * ended; in a shell it is a build that compiled or a dev server that finished
+ * serving a request, which is activity, not a thing that wants you. So the
+ * notification follows the same definition of "agent" the sidebar and `gt list`
+ * use (isAgentSurface): detection, hooks, or whatever [agents] has been widened
+ * to include — turn on include_busy and busy tabs notify again with the rest.
+ *
+ * A notification the program asks for by name — its own OSC 9/777, or
+ * `gt notify` — is not derived and never passes through here.
+ */
+function notifiesOnStatus(surfaceId: string): boolean {
+  const meta = store.surfaces[surfaceId];
+  return !!meta && isAgentSurface(meta);
+}
+
+/**
  * `silent`: the caller has already notified for this event (an OSC 9 from the
  * program itself), so the status change must not send a second one.
  */
@@ -468,7 +505,12 @@ function applyStatus(surfaceId: string, status: AgentStatus, silent = false): vo
       }
     }),
   );
-  if (!silent && (status === "done" || status === "blocked") && !isVisibleActive(surfaceId)) {
+  if (
+    !silent &&
+    (status === "done" || status === "blocked") &&
+    !isVisibleActive(surfaceId) &&
+    notifiesOnStatus(surfaceId)
+  ) {
     notifySurface(surfaceId, status);
   }
 }
@@ -725,6 +767,13 @@ export function hostEvents(): HostEvents {
       applyStatus(id, "blocked", true);
     },
     onModes: (id, modes) => registry.get(id)?.setMouseModes(modes),
+    // A program in a pane copied. Nothing here to decide: it happened because
+    // the user selected something in it (claude copies on every drag-select),
+    // and the emulator it was addressed to has no clipboard to put it on.
+    onClipboard: (id, payload) => {
+      dbg("clipboard relay", { id, bytes: payload.length });
+      relayToHostTerminal(osc52(payload));
+    },
     onCursorRequest: (id, seq) => registry.get(id)?.answerCursor(seq),
     onLost: () => {
       // The surfaces are fine — we just lost our handle on them. Ask the daemon
@@ -901,6 +950,18 @@ function restoreSession(snap: PersistedSession, live: Map<string, HostSurfaceInf
   return true;
 }
 
+/**
+ * Move the active workspace, remembering the one being left so prefix+z can
+ * jump back to it. Every path that changes `activeWorkspaceId` goes through
+ * here — miss one and the back-jump points at a workspace two hops ago.
+ * Meant to be called inside a produce() block.
+ */
+function activate(s: StoreShape, wsId: string): void {
+  if (s.activeWorkspaceId === wsId) return;
+  s.lastWorkspaceId = s.activeWorkspaceId;
+  s.activeWorkspaceId = wsId;
+}
+
 /** Create a workspace with one pane + surface and switch to it. */
 export function createWorkspace(opts: { name?: string; command?: string; args?: string[] } = {}): string {
   const wsId = nextId("w");
@@ -913,7 +974,7 @@ export function createWorkspace(opts: { name?: string; command?: string; args?: 
       s.workspaces[wsId] = { id: wsId, name, layout: leaf(paneId), focusedPaneId: paneId };
       s.workspaceOrder.push(wsId);
       s.panes[paneId] = { id: paneId, surfaceIds: [], activeIdx: 0 };
-      s.activeWorkspaceId = wsId;
+      activate(s, wsId);
       // A new workspace is made to be typed in — keys go to its terminal,
       // not to the sidebar that may have triggered this.
       s.sidebar.focused = false;
@@ -932,7 +993,7 @@ export function createWorkspace(opts: { name?: string; command?: string; args?: 
 
 export function switchWorkspace(wsId: string): void {
   if (!store.workspaces[wsId]) return;
-  setStore("activeWorkspaceId", wsId);
+  setStore(produce((s) => activate(s, wsId)));
   const ws = store.workspaces[wsId]!;
   const pane = store.panes[ws.focusedPaneId];
   const active = pane?.surfaceIds[pane.activeIdx];
@@ -952,6 +1013,17 @@ export function cycleWorkspace(delta: 1 | -1): void {
   const next = order[(((idx === -1 ? 0 : idx) + delta) % order.length + order.length) % order.length];
   if (!next) return;
   switchWorkspace(next);
+  blurSidebar();
+}
+
+/**
+ * Back to the workspace we came from, tmux's last-window. Pressed twice it
+ * returns here, so it is a toggle between the two you are moving between.
+ */
+export function lastWorkspace(): void {
+  const wsId = store.lastWorkspaceId;
+  if (!wsId || wsId === store.activeWorkspaceId || !store.workspaces[wsId]) return;
+  switchWorkspace(wsId);
   blurSidebar();
 }
 
@@ -988,9 +1060,10 @@ function removeEmptyWorkspace(wsId: string): void {
       if (idx !== -1) s.workspaceOrder.splice(idx, 1);
       delete s.workspaces[wsId];
       if (s.activeWorkspaceId === wsId) {
-        s.activeWorkspaceId =
-          s.workspaceOrder[Math.min(idx, s.workspaceOrder.length - 1)] ?? "";
+        activate(s, s.workspaceOrder[Math.min(idx, s.workspaceOrder.length - 1)] ?? "");
       }
+      // A deleted workspace is not somewhere to jump back to.
+      if (s.lastWorkspaceId === wsId) s.lastWorkspaceId = "";
       s.sidebar.workspaceIdx = Math.max(
         0,
         Math.min(s.sidebar.workspaceIdx, s.workspaceOrder.length - 1),
@@ -1025,11 +1098,11 @@ export function syncSizes(): void {
   }
 }
 
-export function setResizeMode(active: boolean): void {
-  setStore("resizeMode", active);
+export function setArrangeMode(active: boolean): void {
+  setStore("arrangeMode", active);
 }
 
-/** h/j/k/l steps in resize mode. Horizontal cells are ~half as wide as tall. */
+/** h/j/k/l steps in arrange mode. Horizontal cells are ~half as wide as tall. */
 const RESIZE_STEP_COLS = 2;
 const RESIZE_STEP_ROWS = 1;
 
@@ -1041,7 +1114,19 @@ function applyDivider(
 ): void {
   const min = minSize(target.dir);
   if (target.total < 2 * min) return;
-  const ratio = Math.max(min, Math.min(target.total - min, aw)) / target.total;
+  const cells = Math.max(min, Math.min(target.total - min, aw));
+  /**
+   * Aim at the MIDDLE of that cell. The divider lives as a float ratio but is
+   * moved in whole cells, and layout reads it back with `floor(total * ratio)`
+   * — for many sizes `cells / total` is not exactly representable and the
+   * product lands a hair under, rendering the divider one cell short of where
+   * it was put. A drag rides through that (the next pointer position asks for a
+   * different cell), but h/j/k/l recomputes its step from the rendered
+   * position: it asked for the same unreachable cell every time and resizing
+   * stopped dead part way across. Half a cell of slack makes the round trip
+   * exact for every position.
+   */
+  const ratio = (cells + 0.5) / target.total;
   setStore(
     produce((s) => {
       const layout = s.workspaces[wsId]?.layout;
@@ -1053,7 +1138,7 @@ function applyDivider(
   pushLayout();
 }
 
-/** Resize-mode step: move the focused pane's nearest divider on that axis. */
+/** Arrange-mode h/j/k/l: move the focused pane's nearest divider on that axis. */
 export function resizeFocused(dir: "left" | "right" | "up" | "down"): void {
   const ws = activeWorkspace();
   if (!ws?.layout) return;
@@ -1074,9 +1159,52 @@ export function endDividerDrag(): void {
   if (store.dividerDrag) setStore("dividerDrag", null);
 }
 
-/** True while a divider is being dragged — the mouse belongs to the drag. */
-export function dividerDragging(): boolean {
-  return store.dividerDrag !== null;
+/** Mouse-down on a tab: everything until the release may reorder the strip. */
+export function startTabDrag(paneId: string, idx: number): void {
+  const surfaceId = store.panes[paneId]?.surfaceIds[idx];
+  if (!surfaceId) return;
+  setStore("tabDrag", { paneId, surfaceId });
+}
+
+/** Slot the dragged tab occupies right now, or -1 when no drag is running. */
+export function tabDragIndex(): number {
+  const drag = store.tabDrag;
+  if (!drag) return -1;
+  return store.panes[drag.paneId]?.surfaceIds.indexOf(drag.surfaceId) ?? -1;
+}
+
+/**
+ * A pointer position during a tab drag, already hit-tested to a slot by the
+ * strip (the only place that knows where its tabs were drawn). The reorder
+ * happens now rather than on release, so the strip shows the order that letting
+ * go will leave behind.
+ */
+export function dragTabTo(idx: number): void {
+  const drag = store.tabDrag;
+  if (!drag) return;
+  const from = tabDragIndex();
+  // Closed from under the drag (`gt`, another client, the program exiting).
+  if (from === -1) {
+    endTabDrag();
+    return;
+  }
+  moveTab(drag.paneId, from, drag.paneId, idx);
+}
+
+export function endTabDrag(): void {
+  if (store.tabDrag) setStore("tabDrag", null);
+}
+
+export function tabDragging(): boolean {
+  return store.tabDrag !== null;
+}
+
+/**
+ * True while any mux-level drag owns the mouse. A drag that crosses a pane is
+ * not input for the program in it, however much that program wants the mouse.
+ */
+export function mouseGrabbed(): boolean {
+  return store.dividerDrag !== null || store.tabDrag !== null;
 }
 
 /**
@@ -1172,13 +1300,76 @@ export function cycleTab(paneId: string, delta: number): void {
   selectTab(paneId, idx);
 }
 
+/**
+ * Move a tab: along its own strip, or into another pane. `to` is the slot it
+ * lands on, clamped — a drag that runs off the end parks the tab there rather
+ * than wrapping round to the far side. Returns false when nothing moved.
+ *
+ * Whatever was active stays active: within a strip the selection follows the
+ * surfaces, not the slots, so shuffling tabs never switches the one you are
+ * typing in. A tab moved to another pane takes the focus with it (you put it
+ * there to look at it), and a pane left with no tabs closes, exactly as it
+ * does when its last tab is closed.
+ */
+export function moveTab(fromPaneId: string, from: number, toPaneId: string, to: number): boolean {
+  const src = store.panes[fromPaneId];
+  const dst = store.panes[toPaneId];
+  if (!src || !dst) return false;
+  const surfaceId = src.surfaceIds[from];
+  if (!surfaceId) return false;
+  const samePane = fromPaneId === toPaneId;
+  // Within a strip the tab vacates its own slot first, so the last index it can
+  // reach is one less than the count.
+  const target = Math.max(
+    0,
+    Math.min(samePane ? src.surfaceIds.length - 1 : dst.surfaceIds.length, to),
+  );
+  if (samePane && target === from) return false;
+
+  const activeId = src.surfaceIds[src.activeIdx];
+  let emptyPaneId: string | null = null;
+  setStore(
+    produce((s) => {
+      const a = s.panes[fromPaneId]!;
+      const b = s.panes[toPaneId]!;
+      a.surfaceIds.splice(from, 1);
+      b.surfaceIds.splice(target, 0, surfaceId);
+      if (samePane) {
+        const stillActive = activeId ? a.surfaceIds.indexOf(activeId) : -1;
+        a.activeIdx = stillActive === -1 ? target : stillActive;
+      } else {
+        a.activeIdx = Math.min(a.activeIdx, Math.max(0, a.surfaceIds.length - 1));
+        b.activeIdx = target;
+        if (a.surfaceIds.length === 0) emptyPaneId = a.id;
+      }
+    }),
+  );
+  if (!samePane) {
+    if (emptyPaneId) closePane(emptyPaneId);
+    // The surface remounts under its new pane, re-subscribes and gets the
+    // replay back from the host — see runtime.attachRenderable.
+    focusPane(toPaneId);
+    syncSizes();
+  }
+  pushLayout();
+  return true;
+}
+
+/** Arrange mode H/L: shove the focused tab one slot along its strip. */
+export function dragFocusedTab(delta: 1 | -1): void {
+  const paneId = focusedPaneId();
+  const pane = store.panes[paneId];
+  if (!pane) return;
+  moveTab(paneId, pane.activeIdx, paneId, pane.activeIdx + delta);
+}
+
 /** Focus a pane; switches to its workspace and takes focus off the sidebar. */
 export function focusPane(paneId: string): void {
   const wsId = workspaceOf(paneId);
   if (!wsId) return;
   setStore(
     produce((s) => {
-      s.activeWorkspaceId = wsId;
+      activate(s, wsId);
       s.workspaces[wsId]!.focusedPaneId = paneId;
       s.sidebar.focused = false;
     }),
@@ -1203,7 +1394,7 @@ function revealSurface(surfaceId: string, focus: boolean): void {
     setStore(
       produce((s) => {
         s.panes[pane.id]!.activeIdx = idx;
-        s.activeWorkspaceId = wsId;
+        activate(s, wsId);
         s.workspaces[wsId]!.focusedPaneId = pane.id;
         if (focus) s.sidebar.focused = false;
       }),
@@ -1421,6 +1612,31 @@ export function sidebarMove(delta: 1 | -1): void {
       }
     }),
   );
+}
+
+/**
+ * Shift+j/k: drag the selected workspace down/up the order, the selection
+ * riding along with it. Only the workspaces half is orderable — the agents
+ * list is derived and sorted by status, so there is nothing to drag there.
+ * Deliberately does not wrap: at the ends you feel the edge instead of the
+ * row leaping to the far side of the list.
+ */
+export function sidebarDragWorkspace(delta: 1 | -1): void {
+  const sb = store.sidebar;
+  if (sb.section !== "workspaces") return;
+  const from = sb.workspaceIdx;
+  const wsId = store.workspaceOrder[from];
+  const to = from + delta;
+  if (!wsId || to < 0 || to >= store.workspaceOrder.length) return;
+  setStore(
+    produce((s) => {
+      s.workspaceOrder.splice(from, 1);
+      s.workspaceOrder.splice(to, 0, wsId);
+      s.sidebar.workspaceIdx = to;
+    }),
+  );
+  // The order is the snapshot's order, so a drag outlives a reload.
+  pushLayout();
 }
 
 /** Enter: open the selected workspace, or jump to the selected agent. */

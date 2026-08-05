@@ -250,3 +250,17 @@ export async function readProcTable(): Promise<ProcTable> {
     return new Map();
   }
 }
+
+/**
+ * Same table, blocking — for the way out, where the pty host has one pass left
+ * to find the surfaces that outlived their SIGHUP (see ptyhost killSurvivors).
+ */
+export function readProcTableSync(): ProcTable {
+  try {
+    const proc = Bun.spawnSync(PS_ARGS, { stdout: "pipe", stderr: "ignore" });
+    return parseProcTable(proc.stdout.toString());
+  } catch (err) {
+    dbg("procs: ps failed", err as Error);
+    return new Map();
+  }
+}

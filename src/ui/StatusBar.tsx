@@ -51,8 +51,8 @@ export function StatusBar() {
       <Show when={store.prefixArmed}>
         <text content=" PREFIX " fg={theme.prefixFg} bg={theme.prefixBg} />
       </Show>
-      <Show when={store.resizeMode}>
-        <text content=" RESIZE h j k l · esc " fg={theme.prefixFg} bg={theme.done} />
+      <Show when={store.arrangeMode}>
+        <text content=" ARRANGE hjkl size · HL tab · esc " fg={theme.prefixFg} bg={theme.done} />
       </Show>
       <Show when={store.sidebar.focused}>
         <text content=" SIDEBAR " fg={theme.prefixFg} bg={theme.accent} />

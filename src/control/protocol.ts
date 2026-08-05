@@ -219,5 +219,11 @@ export type HostServerFrame =
   | { t: "title"; id: string; title: string }
   | { t: "notify"; id: string; title: string; body: string }
   | { t: "modes"; id: string; modes: MouseModes }
+  /**
+   * A program in this surface copied something (OSC 52). Base64 already, and
+   * relayed unchanged — only the TUI can reach the terminal the user is looking
+   * at. See core/clipboard.
+   */
+  | { t: "clip"; id: string; d: string }
   /** The program asked where the cursor is; only the TUI's emulator knows. */
   | { t: "cpr-req"; id: string; seq: number };

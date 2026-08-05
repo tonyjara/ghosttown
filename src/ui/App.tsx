@@ -26,10 +26,13 @@ import {
   dialogConfirm,
   dialogMove,
   dragDivider,
+  dragFocusedTab,
   endDividerDrag,
+  endTabDrag,
   focusDirection,
   focusedPaneId,
   isFinderDialog,
+  lastWorkspace,
   newTab,
   openDeleteProfile,
   openDeleteWorkspace,
@@ -47,11 +50,12 @@ import {
   restartApp,
   selectTab,
   setArea,
+  setArrangeMode,
   setHelpVisible,
   setPrefixArmed,
-  setResizeMode,
   sidebarCreate,
   sidebarDelete,
+  sidebarDragWorkspace,
   sidebarEnter,
   sidebarMove,
   sidebarRename,
@@ -68,6 +72,7 @@ import { HelpOverlay } from "./HelpOverlay";
 import { PaneView } from "./PaneView";
 import { Sidebar } from "./Sidebar";
 import { StatusBar } from "./StatusBar";
+import { dragTabAt } from "./tabs";
 import { theme } from "./theme";
 
 const PREFIX_TIMEOUT_MS = 3000;
@@ -112,7 +117,7 @@ function runAction(action: Action): void {
       toggleSidebar();
       return;
     case "resize-mode":
-      setResizeMode(true);
+      setArrangeMode(true);
       return;
     case "switch-profile":
       openSwitchProfile();
@@ -128,6 +133,9 @@ function runAction(action: Action): void {
       return;
     case "prev-workspace":
       cycleWorkspace(-1);
+      return;
+    case "last-workspace":
+      lastWorkspace();
       return;
     case "rename-workspace":
       openRenameWorkspace();
@@ -216,8 +224,23 @@ function handleDialogKey(key: KeyEvent): void {
   }
 }
 
-/** Keys while resize mode is active: h/j/k/l move dividers, esc/enter leave. */
-function handleResizeModeKey(key: KeyEvent): void {
+/**
+ * Keys while arrange mode is active: h/j/k/l move the focused pane's dividers,
+ * shifted H/L walk the focused tab along its strip, esc/enter leave.
+ */
+function handleArrangeModeKey(key: KeyEvent): void {
+  // Shift picks the tab up instead of the divider, the same way it reorders
+  // rows in the sidebar. A shifted letter arrives as name "h" + shift with
+  // sequence "H", and the switch below reads the name alone — so these have to
+  // come first, before h/l swallow them.
+  if (key.sequence === "H" || (key.shift && key.name === "left")) {
+    dragFocusedTab(-1);
+    return;
+  }
+  if (key.sequence === "L" || (key.shift && key.name === "right")) {
+    dragFocusedTab(1);
+    return;
+  }
   switch (key.name) {
     case "h":
     case "left":
@@ -237,15 +260,26 @@ function handleResizeModeKey(key: KeyEvent): void {
       return;
     case "escape":
     case "q":
-      setResizeMode(false);
+      setArrangeMode(false);
       return;
   }
-  if (isEnter(key)) setResizeMode(false);
+  if (isEnter(key)) setArrangeMode(false);
   // Everything else is swallowed — it's a mode.
 }
 
 /** Direct (un-prefixed) keys while the sidebar has focus. */
 function handleSidebarKey(key: KeyEvent): void {
+  // Shift+j/k reorders instead of moving the cursor. A shifted letter arrives
+  // as name "j" + shift, sequence "J", and the switch below reads the name
+  // alone — so the drag has to be picked off before j/k swallow it.
+  if (key.sequence === "J" || (key.shift && key.name === "down")) {
+    sidebarDragWorkspace(1);
+    return;
+  }
+  if (key.sequence === "K" || (key.shift && key.name === "up")) {
+    sidebarDragWorkspace(-1);
+    return;
+  }
   switch (key.name) {
     case "j":
     case "down":
@@ -345,14 +379,14 @@ export function App() {
       return;
     }
 
-    // Resize mode: modal over the ptys, but the prefix still works.
-    if (store.resizeMode) {
+    // Arrange mode: modal over the ptys, but the prefix still works.
+    if (store.arrangeMode) {
       if (isPrefix(key)) {
-        setResizeMode(false);
+        setArrangeMode(false);
         arm();
         return;
       }
-      handleResizeModeKey(key);
+      handleArrangeModeKey(key);
       return;
     }
 
@@ -394,7 +428,7 @@ export function App() {
   // `.text` that does not exist is how dropping a file onto a pane did nothing.
   usePaste((event) => {
     const text = new TextDecoder().decode(event.bytes);
-    if (text && !store.dialog && !store.sidebar.focused && !store.resizeMode) {
+    if (text && !store.dialog && !store.sidebar.focused && !store.arrangeMode) {
       pasteToFocused(text);
     }
   });
@@ -408,12 +442,13 @@ export function App() {
     return allRects();
   });
 
-  // Divider drag: mousedown on a gutter starts a session (in the store, so the
-  // panes know not to touch the mouse while it runs); the ROOT box sees every
-  // drag/up event via bubbling. Opentui captures the renderable the pointer is
-  // over on the FIRST drag event and dispatches the rest of the drag to it, so
-  // the target is either a gutter or a pane — either way propagation reaches
-  // the root, as long as the captured renderable stays alive (see <Index>).
+  // Divider and tab drags: mousedown on a gutter or a tab starts a session (in
+  // the store, so the panes know not to touch the mouse while it runs); the
+  // ROOT box sees every drag/up event via bubbling. Opentui captures the
+  // renderable the pointer is over on the FIRST drag event and dispatches the
+  // rest of the drag to it, so the target is a gutter, a tab or a pane — either
+  // way propagation reaches the root, as long as the captured renderable stays
+  // alive (see <Index>, and For's keying in TabStrip).
   const [hoveredGutter, setHoveredGutter] = createSignal<string | null>(null);
   const gutters = createMemo(() => {
     void store.screen.width;
@@ -430,25 +465,36 @@ export function App() {
         y >= g.rect.y &&
         y < g.rect.y + g.rect.height,
     );
+  const endDrags = () => {
+    endDividerDrag();
+    endTabDrag();
+  };
 
   return (
     <box
       width="100%"
       height="100%"
       backgroundColor={theme.bg}
-      onMouseDrag={(e: { x: number; y: number }) => dragDivider(e.x, e.y)}
-      onMouseUp={endDividerDrag}
-      onMouseDragEnd={endDividerDrag}
-      onMouseDrop={endDividerDrag}
+      // One drag at a time: a tab being carried owns the pointer, and a gutter
+      // press cannot happen while it is (the strip is not a gutter).
+      onMouseDrag={(e: { x: number; y: number }) => {
+        if (store.tabDrag) dragTabAt(e.x);
+        else dragDivider(e.x, e.y);
+      }}
+      onMouseUp={endDrags}
+      onMouseDragEnd={endDrags}
+      onMouseDrop={endDrags}
       // Insurance, and it matters more than it sounds: a drag whose release
       // never arrives — released outside the window, or the event was lost —
       // would go on swallowing the mouse in every pane, and scrolling inside
       // an agent would simply stop working until the next click. So anything
       // that cannot be part of a drag ends it: a wheel notch, buttonless
-      // motion (nothing is held), or a press off the gutters (a press ON one
-      // starts the next drag, below).
-      onMouseScroll={endDividerDrag}
-      onMouseMove={endDividerDrag}
+      // motion (nothing is held), or a press off the gutters (a press ON one,
+      // or on a tab, starts the next drag — see the gutter boxes and TabStrip).
+      onMouseScroll={endDrags}
+      onMouseMove={endDrags}
+      // Divider only: a tab press has already run its own handler on the way
+      // up here, and ending that drag would undo it before it began.
       onMouseDown={(e: { x: number; y: number }) => {
         if (!onGutter(e.x, e.y)) endDividerDrag();
       }}

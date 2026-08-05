@@ -10,9 +10,17 @@
  * *incomplete* sequence, so nothing is ever matched (and answered) twice.
  */
 
+import { parseClipboardWrite } from "./clipboard";
 import { applyMouseMode, mouseModeState, MOUSE_MODES_OFF, type MouseModes } from "./mouse";
 
 const MAX_CARRY = 4096;
+/**
+ * OSC gets its own, much larger carry: a clipboard write (OSC 52) is as long as
+ * whatever the user selected, and a chunk boundary lands in the middle of it
+ * routinely. At 4096 the tail was dropped and the copy lost — silently, and only
+ * for big selections, which is the worst way for it to fail.
+ */
+const MAX_OSC_CARRY = 1 << 20;
 
 /** CPR answer for a 0-based cursor — the deferred path builds it by hand. */
 export function cursorReport(priv: string, x: number, y: number): string {
@@ -32,6 +40,11 @@ export interface ScannerHooks {
   deferCursorReport?: (priv: string) => boolean;
   onTitle?: (title: string) => void;
   onNotify?: (title: string, body: string) => void;
+  /**
+   * The program copied something (OSC 52). Already-encoded base64, to be
+   * relayed to the host terminal as-is — see core/clipboard.
+   */
+  onClipboard?: (payloadBase64: string) => void;
 }
 
 const CSI_QUERY =
@@ -129,6 +142,13 @@ export class OutputScanner {
         // OSC 9;4;... is ConEmu progress, not a notification.
         if (!body.startsWith("4;")) this.hooks.onNotify?.("", body);
         break;
+      case "52": {
+        // The emulator cannot hold a clipboard, so this one has to leave the
+        // process entirely. Reads are refused by parseClipboardWrite.
+        const payload = parseClipboardWrite(body);
+        if (payload) this.hooks.onClipboard?.(payload);
+        break;
+      }
       case "777": {
         const parts = body.split(";");
         if (parts[0] === "notify") {
@@ -148,24 +168,46 @@ export class OutputScanner {
   }
 }
 
-/**
- * If `text` ends inside an unterminated escape sequence, return that suffix
- * (capped) so it can be prepended to the next chunk.
- */
-export function trailingIncompleteEscape(text: string): string {
-  const escIdx = text.lastIndexOf("\x1b");
-  if (escIdx === -1) return "";
-  const tail = text.slice(escIdx);
-  if (tail.length > MAX_CARRY) return "";
-  if (tail.length === 1) return tail; // lone ESC — could be anything
+/** Is the sequence starting at `tail[0]` (an ESC) still waiting for its end? */
+function isIncomplete(tail: string): boolean {
+  if (tail.length === 1) return true; // lone ESC — could be anything
   const kind = tail[1];
   if (kind === "[") {
     // CSI: complete once a final byte (0x40–0x7E) appears.
-    return /[\x40-\x7e]/.test(tail.slice(2)) ? "" : tail;
+    return !/[\x40-\x7e]/.test(tail.slice(2));
   }
   if (kind === "]" || kind === "P") {
     // OSC / DCS: complete on BEL or ST.
-    return tail.includes("\x07") || tail.includes("\x1b\\") ? "" : tail;
+    return !tail.includes("\x07") && !tail.includes("\x1b\\");
   }
-  return ""; // two-char escape (ESC x) — complete
+  return false; // two-char escape (ESC x) — complete
+}
+
+/** How many trailing ESCs to consider; see the walk in trailingIncompleteEscape. */
+const MAX_ESC_CANDIDATES = 8;
+
+/**
+ * If `text` ends inside an unterminated escape sequence, return that suffix
+ * (capped) so it can be prepended to the next chunk.
+ *
+ * The *last* ESC is not always the right place to start. An OSC ending in ST
+ * (`ESC \`) that is split exactly at that ESC leaves a lone trailing ESC with
+ * the whole unterminated OSC in front of it — carrying only the ESC would drop
+ * the sequence. So the walk keeps stepping left while what it finds is still
+ * incomplete, and stops at the first complete sequence.
+ */
+export function trailingIncompleteEscape(text: string): string {
+  let carry = "";
+  let from = text.length;
+  for (let n = 0; n < MAX_ESC_CANDIDATES; n++) {
+    const escIdx = text.lastIndexOf("\x1b", from - 1);
+    if (escIdx === -1) break;
+    const tail = text.slice(escIdx);
+    if (!isIncomplete(tail)) break;
+    carry = tail;
+    from = escIdx;
+  }
+  if (!carry) return "";
+  const cap = carry[1] === "]" ? MAX_OSC_CARRY : MAX_CARRY;
+  return carry.length > cap ? "" : carry;
 }

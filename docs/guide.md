@@ -26,7 +26,7 @@ help pane always matches what your keys actually do.
 | `\|` or `\` | split right |
 | `-` | split down |
 | `h j k l` / arrows | focus pane by direction |
-| `r` | **resize mode** — `h j k l`/arrows move the divider, `esc` leaves |
+| `r` | **arrange mode** — `h j k l`/arrows move the divider, `H`/`L` move the focused tab along its strip, `esc` leaves |
 | `T` (shift+t) | new tab in the focused pane |
 | `n` / `p` | next / previous tab |
 | `1`–`9` | select tab N |
@@ -34,6 +34,7 @@ help pane always matches what your keys actually do.
 | `,` | rename this tab (sticks; empty restores the program's title) |
 | `w` | **find workspace** — fuzzy switcher with an input |
 | `N` / `P` (shift+n / shift+p) | next / previous workspace (wraps) |
+| `z` | back to the **last workspace** you were in (press again to return) |
 | `C` (shift+c) | **new workspace** (its terminal takes focus) |
 | `W` (shift+w) | **rename workspace** |
 | `X` (shift+x) | **delete workspace** (confirm dialog) |
@@ -66,10 +67,51 @@ revealing the agent), **drag the divider between panes to resize them** — the
 gap is drawn as a seam and lights up under the pointer. It stays a drag even
 when it crosses a pane whose program owns the mouse.
 
+**Drag a tab along its strip to sort it.** Press it and move: the tab is
+highlighted while you hold it and the strip reorders as you go, so what you see
+before letting go is what you get. It displaces a neighbour once you pass that
+neighbour's middle, and parks at the end rather than wrapping if you overshoot.
+Only the column matters — the pointer wandering off the one-row strip does not
+drop the tab. Keyboard equivalent: `prefix r` then `H`/`L`. The order is part of
+the session snapshot, so it survives a reload.
+
 Paste and drag-and-drop go to the focused pane: dropping a file on the window
 types its path into whatever is running there (that is a bracketed paste, which
 is how your terminal delivers a drop), and it is bracketed on the way to the
 program only if that program asked for `?2004`.
+
+## Copying
+
+**Select text in an agent pane and it is on your clipboard when you let go.**
+There is nothing to press afterwards — and nothing that *could* be: ⌘C belongs to
+the terminal ghosttown runs in, which has no idea a selection inside a pane
+exists. The copy leaves through OSC 52 instead, the same escape sequence tmux
+relays with `set-clipboard on`, so it works over ssh and needs no helper binary.
+Ghostty allows clipboard writes by default (`clipboard-write = allow`); a
+terminal set to `deny` will drop them.
+
+Two things happen depending on what the agent does with the mouse:
+
+| The agent | Selecting | Copying |
+| --- | --- | --- |
+| asks for the mouse (`?1000`/`?1002`/`?1003`) — claude | the agent's own selection, drawn by the agent | the agent emits OSC 52 itself; ghosttown relays it out |
+| never asks — codex | ghosttown's selection, drawn by the pane | ghosttown copies it when the drag ends |
+
+**This is scoped to agent panes** — the same list that puts a tab in the sidebar,
+`[agents] commands` (claude, codex, gemini, aider, … — see the config). A pane
+running a shell, neovim, a pager or anything else behaves exactly as it did
+before: selection still highlights, and nothing reaches your clipboard unless
+that program's own copy path does it. Editors have their own ideas about the
+mouse and their own clipboard integration, and a mux that intercepts either one
+gets in the way.
+
+Clipboard *reads* (`OSC 52` with `?`) are never relayed, from any pane: the
+answer would arrive on ghosttown's stdin, indistinguishable from you typing your
+clipboard into the focused pane.
+
+If you want a selection outside an agent pane, hold **shift** while dragging —
+that bypasses ghosttown entirely and gives you your terminal's own selection,
+where ⌘C works as usual (Ghostty's `mouse-shift-capture = false` default).
 
 ## Workspaces and finders
 
@@ -99,6 +141,7 @@ panes. While the sidebar is focused, keys are direct — no prefix:
 | Key | Action |
 |---|---|
 | `j` / `k` | move down / up (flows between the two halves) |
+| `J` / `K` (shift+j / shift+k) | **reorder** — drag the selected workspace down / up |
 | `enter` | open the workspace / jump to the agent |
 | `a` | new workspace (focus follows into its terminal) |
 | `r` | rename the workspace / the selected agent's tab |
@@ -111,6 +154,19 @@ tagged with the workspace it lives in, in inbox order: `⚑ blocked` first, then
 `✓ done`, `✳ running`, and `○ idle`. It gets all the room the workspace list
 above it does not need, and the header tallies what scrolled out of view.
 `enter` (or a click) jumps straight to one, switching workspace on the way.
+
+A **running** agent's glyph pulses — `✢ ✳ ✶ ✻ ✽` and back down — so "still
+thinking" reads off the row without having to remember what it said a second
+ago; a still glyph and a hung agent look the same. It is the only thing in the
+UI that animates, and the clock only runs while something is working, so an
+idle sidebar costs nothing.
+
+The agent **you are in** is marked like the workspace you are in, but out of the
+way of its status: a `▌` bar down the left of the row and a dimmer highlight
+behind it, leaving the glyph and its color to say how it is doing. It stays
+marked while you browse the sidebar — you are still in that agent — and the
+cursor's own highlight wins the row it is on. The agent finder (`prefix a`)
+marks its rows the same way.
 
 An agent is found by looking for it, not by waiting for it to say something: the
 session daemon walks each pane's process tree every couple of seconds. So a
@@ -155,6 +211,21 @@ emulators from the daemon's replay buffers (last 512 KB of output per surface,
 
 Detaching is the same story from the other side: the session is still running,
 you just stopped looking at it.
+
+## Closing a tab ends what was in it
+
+Closing a tab (`prefix D`, or the `×` on the tab) hangs its program up — the same
+SIGHUP a real terminal sends when its window goes away — and it goes to the whole
+process group, so the shell, the agent inside it and whatever that agent spawned
+all leave together. Nothing keeps running behind a tab you can no longer see.
+
+A program that ignores hangups doesn't get to stay: 1.5s later it gets SIGTERM,
+and 4s after the close, SIGKILL. The wait is for the agent that is mid-write when
+you close its tab; the escalation is for the graceful-shutdown handler that never
+gets around to exiting, which would otherwise hold its memory (and its children's)
+until you reboot. `prefix Q` and a profile kill sweep the same way, just as the
+daemon goes. The one thing that *does* outlive the TUI is a detached session —
+that one is on purpose, and `gt profiles` is where you find it again.
 
 ## Session snapshots
 
@@ -205,8 +276,8 @@ has left is not. Failing that, a surface that reports via `gt report` counts too
 2. **Heuristic (fallback).** For anything without hooks: sustained output →
    working; work followed by quiet → done.
 
-Done/blocked in a non-visible tab → unread badge + desktop notification
-(disable with `GHOSTTOWN_NO_NOTIFY=1`).
+Done/blocked in a non-visible tab → unread badge, and a desktop notification if
+the tab is an agent (disable with `GHOSTTOWN_NO_NOTIFY=1`).
 
 ## Notifications
 
@@ -228,6 +299,16 @@ the message from Claude Code's `Notification` hook (which is the actual
 permission prompt), the program's own `OSC 9` notification text, or the last
 meaningful line of its screen — input boxes, hint bars and shell prompts are
 skipped.
+
+**Only agents notify.** The status behind a notification is derived — from hooks,
+or from output going quiet — and quiet means different things in different tabs:
+in an agent a turn ended, in a shell a build compiled or a dev server finished
+serving a request. So the filter is the same "which tabs are agents" above, and a
+`pnpm dev` in a background workspace stays silent no matter how it churns. If you
+run an agent under a command name detection does not know, `[agents]
+include_busy = true` puts busy tabs back in the list, notifications included.
+A program that asks for a notification *by name* is never filtered: its own
+`OSC 9`/`OSC 777` and `gt notify "deploy finished"` always go out.
 
 **Click-to-focus needs `terminal-notifier`** (`brew install terminal-notifier`):
 macOS's built-in `osascript` notifications cannot carry a click action, so

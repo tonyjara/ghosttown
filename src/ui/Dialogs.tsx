@@ -161,6 +161,12 @@ export function DialogOverlay() {
     return item.current ? "●" : " ";
   };
 
+  /**
+   * An agent's marker column is spoken for by its status, so "the one you are
+   * in" goes in the margin as a bar instead — the same mark the sidebar uses.
+   */
+  const rowHere = (item: FinderItem) => (item.status && item.current ? "▌" : " ");
+
   return (
     <box
       position="absolute"
@@ -261,12 +267,18 @@ export function DialogOverlay() {
               return (
                 <text
                   content={twoColumnRow(
-                    ` ${selected() ? "❯" : " "} ${rowMarker(entry.item)} ${entry.item.label}`,
+                    `${rowHere(entry.item)}${selected() ? "❯" : " "} ${rowMarker(entry.item)} ${entry.item.label}`,
                     `${entry.item.hint} `,
                     width() - 2,
                   )}
                   fg={rowFg(selected(), entry.item)}
-                  bg={selected() ? theme.sidebarSelBg : theme.stripBgFocused}
+                  bg={
+                    selected()
+                      ? theme.sidebarSelBg
+                      : entry.item.current
+                        ? theme.sidebarCurBg
+                        : theme.stripBgFocused
+                  }
                   onMouseDown={() => dialogPick(entry.idx)}
                 />
               );

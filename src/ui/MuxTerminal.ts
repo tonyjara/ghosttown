@@ -5,6 +5,7 @@ import {
   terminalDataToStyledText,
   type HighlightRegion,
 } from "ghostty-opentui/opentui";
+import { osc52Text, relayToHostTerminal } from "../core/clipboard";
 import { loadConfig } from "../core/config";
 import {
   encodeMouseEvent,
@@ -95,6 +96,26 @@ let appliedCursorStyle = "";
  */
 export const LNM_OFF = "\x1b[20l";
 
+/** The selection argument opentui hands to onSelectionChanged. */
+type SelectionArg = Parameters<GhosttyTerminalRenderable["onSelectionChanged"]>[0];
+
+/** The two bits of a live selection copy-on-select needs. */
+interface SelectionState {
+  isDragging: boolean;
+  isActive: boolean;
+}
+
+/**
+ * A drag that just ended is the moment "selected" becomes "copied": dragging on
+ * the previous notification, not dragging now. The renderable is told about
+ * every step of a drag, so without the transition the same text would be copied
+ * again on each one.
+ */
+export function selectionFinished(wasDragging: boolean, selection: SelectionState | null): boolean {
+  if (!selection) return false;
+  return wasDragging && selection.isActive && !selection.isDragging;
+}
+
 /** How a surface reaches the program behind it for mouse reporting. */
 export interface MouseDelegate {
   modes: () => MouseModes;
@@ -113,6 +134,10 @@ export class MuxTerminal extends GhosttyTerminalRenderable {
   private mouse: MouseDelegate | null = null;
   /** Whether this surface holds a press the program has not been released of. */
   private pressed = false;
+  /** Whether the last selection notification arrived mid-drag. */
+  private selectionDragging = false;
+  /** Set for agent surfaces only; see onSelectionChanged. */
+  private copyOnSelect: (() => boolean) | null = null;
 
   constructor(...args: ConstructorParameters<typeof GhosttyTerminalRenderable>) {
     super(...args);
@@ -212,6 +237,42 @@ export class MuxTerminal extends GhosttyTerminalRenderable {
   override shouldStartSelection(x: number, y: number): boolean {
     if (this.appOwnsMouse()) return false;
     return super.shouldStartSelection(x, y);
+  }
+
+  /**
+   * Copy on select, the way a native terminal does it: letting go of the mouse
+   * puts the selection on the system clipboard, via OSC 52 to the terminal
+   * ghosttown runs in (core/clipboard).
+   *
+   * Agent panes only, hence the gate — a pane running neovim, a shell or a pager
+   * behaves exactly as it did before, selection highlight and all, and nothing
+   * touches the clipboard behind the user's back.
+   *
+   * Panes whose program owns the mouse never reach this anyway:
+   * shouldStartSelection keeps us out of their way, and they copy themselves —
+   * claude selects with its own highlight and emits its own OSC 52, which
+   * core/state relays.
+   */
+  override onSelectionChanged(selection: SelectionArg): boolean {
+    const result = super.onSelectionChanged(selection);
+    const sel = selection as SelectionState | null;
+    // hasSelection(): a drag that merely *crossed* this pane on its way
+    // elsewhere ends here too, and copying then would hand the clipboard to
+    // whichever pane the release happened to be notified last.
+    if (selectionFinished(this.selectionDragging, sel) && this.copyOnSelect?.() && this.hasSelection()) {
+      const text = this.getSelectedText();
+      if (text) relayToHostTerminal(osc52Text(text));
+    }
+    this.selectionDragging = !!sel?.isDragging;
+    return result;
+  }
+
+  /**
+   * Whether releasing a selection in this pane copies it. Set per surface, from
+   * whether an agent is running in it.
+   */
+  setCopyOnSelect(enabled: () => boolean): void {
+    this.copyOnSelect = enabled;
   }
 
   protected override renderSelf(buffer: OptimizedBuffer): void {

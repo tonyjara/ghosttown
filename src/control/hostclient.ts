@@ -25,6 +25,8 @@ export interface HostEvents {
   onTitle: (id: string, title: string) => void;
   onNotify: (id: string, title: string, body: string) => void;
   onModes: (id: string, modes: MouseModes) => void;
+  /** A program copied (OSC 52); the payload is base64, to be relayed as-is. */
+  onClipboard: (id: string, payloadBase64: string) => void;
   onCursorRequest: (id: string, seq: number) => void;
   /** The socket died — without a host there is nothing left to render. */
   onLost: () => void;
@@ -62,6 +64,9 @@ function deliver(frame: HostServerFrame, events: HostEvents): void {
       return;
     case "modes":
       events.onModes(frame.id, frame.modes);
+      return;
+    case "clip":
+      events.onClipboard(frame.id, frame.d);
       return;
     case "cpr-req":
       events.onCursorRequest(frame.id, frame.seq);

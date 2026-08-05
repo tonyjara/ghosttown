@@ -49,13 +49,20 @@ cursor_blink = true
 # bg = "#101019"
 # Full key list: bg, stripBg, stripBgFocused, tabFg, tabFgActive, tabBgActive,
 # accent, statusBarBg, statusBarFg, prefixFg, prefixBg, working, blocked,
-# done, idle, sidebarBg, sidebarSelBg.
+# done, idle, sidebarBg, sidebarSelBg, sidebarCurBg (the row you are in).
 
 [notifications]
 # Desktop notifications when an agent finishes or blocks in a non-visible tab.
 # Each one names the agent, the workspace it lives in and the tab's own title,
 # and carries a line of context: the hook message for a permission prompt, the
 # program's own notification text, or the last meaningful line of its screen.
+#
+# *Agents* only, by the same definition the sidebar list uses ([agents] below):
+# a shell going quiet after a burst of output is a build that compiled or a dev
+# server that served a request, not something waiting on you. Widen it with
+# [agents] include_busy = true, which puts busy tabs in the agent list and so in
+# the notifications too. A program that asks for a notification itself (OSC 9 /
+# OSC 777, or `gt notify` from a script) is never filtered this way.
 enabled = true
 # macOS notification sound name ("" for silent). E.g. Glass, Ping, Submarine.
 sound = "Glass"
@@ -93,6 +100,12 @@ width = 28
 # Matching is on the program name, so "claude" covers a bare `claude`, an
 # absolute path, and a `node .../claude-code/cli.js` install. A name in an
 # argument never counts (`vim notes/claude.md` is not an agent).
+#
+# This list also decides which panes get the agent-only affordances, which today
+# means copying: selecting in an agent pane puts the text on your clipboard when
+# you let go, and a copy the agent makes itself (claude's OSC 52) is relayed out
+# to your terminal. Panes running anything else are left alone — a shell, an
+# editor or a pager keeps stock terminal behaviour. See docs/guide.md ("Copying").
 #
 # This list REPLACES the default one (that is how config arrays work here), so
 # copy it whole if you only mean to add an entry.
@@ -153,7 +166,9 @@ prefix = "ctrl+a"
 "focus-up" = ["k", "up"]
 "focus-down" = ["j", "down"]
 "toggle-sidebar" = ["b"]
-# Resize mode: h/j/k/l (or arrows) move the pane's divider; esc/enter leave.
+# Arrange mode: h/j/k/l (or arrows) move the focused pane's divider, shifted
+# H/L walk the focused tab along its strip; esc/enter leave. Tabs also sort by
+# dragging them with the mouse, which needs no mode at all.
 "resize-mode" = ["r"]
 # Profiles are whole sessions, each with its own background daemon.
 # switch-profile lists running profiles and is also where they are managed:
@@ -168,6 +183,10 @@ prefix = "ctrl+a"
 # Shifted n/p, mirroring the unshifted next-tab / prev-tab. Wraps around.
 "next-workspace" = ["N"]
 "prev-workspace" = ["P"]
+# Back to the workspace you came from, tmux's last-window. Unlike prev-workspace
+# this ignores the order and follows where you have been: press it twice and you
+# are back where you started, so it toggles between the two you are working in.
+"last-workspace" = ["z"]
 "rename-workspace" = ["W"]
 "delete-workspace" = ["X"]
 # Fuzzy finders, telescope-style: type to filter, ↑/↓ (or ctrl+n / ctrl+p) to
@@ -200,4 +219,5 @@ prefix = "ctrl+a"
 # While the sidebar is focused (reach it with focus-left from the leftmost
 # pane, or by clicking it), keys are direct (no prefix): j/k move, enter opens,
 # a adds a workspace, r renames (a workspace, or the selected agent's tab),
-# d deletes (workspaces confirm; agents die).
+# d deletes (workspaces confirm; agents die), and shift+j / shift+k drag the
+# selected workspace down / up to reorder the list. These are not rebindable.

@@ -6,14 +6,18 @@ function makeScanner(cursor: [number, number] = [4, 2]) {
   const responses: string[] = [];
   const titles: string[] = [];
   const notifies: string[] = [];
+  const clips: string[] = [];
   const scanner = new OutputScanner({
     respond: (d) => responses.push(d),
     getCursor: () => cursor,
     onTitle: (t) => titles.push(t),
     onNotify: (_t, b) => notifies.push(b),
+    onClipboard: (p) => clips.push(p),
   });
-  return { scanner, responses, titles, notifies };
+  return { scanner, responses, titles, notifies, clips };
 }
+
+const b64 = (s: string) => Buffer.from(s, "utf8").toString("base64");
 
 describe("OutputScanner", () => {
   it("answers cursor position reports", () => {
@@ -112,6 +116,38 @@ describe("OutputScanner mouse modes", () => {
     expect(trackingLevel(scanner.mouseModes())).toBe("drag");
   });
 
+  it("reports a clipboard write, and answers nothing back to the child", () => {
+    // What claude emits at the end of every drag-select.
+    const { scanner, clips, responses } = makeScanner();
+    scanner.scan(`\x1b[?25l\x1b]52;c;${b64("selected text")}\x07\x1b[?25h`);
+    expect(clips).toEqual([b64("selected text")]);
+    expect(responses).toEqual([]);
+  });
+
+  it("ignores a clipboard read", () => {
+    const { scanner, clips } = makeScanner();
+    scanner.scan("\x1b]52;c;?\x07");
+    expect(clips).toEqual([]);
+  });
+
+  it("reassembles a clipboard write split across chunks", () => {
+    const { scanner, clips } = makeScanner();
+    const payload = b64("x".repeat(9000)); // longer than the old 4096 carry cap
+    const seq = `\x1b]52;c;${payload}\x07`;
+    for (let i = 0; i < seq.length; i += 3000) scanner.scan(seq.slice(i, i + 3000));
+    expect(clips).toEqual([payload]);
+  });
+
+  it("reassembles a clipboard write split at the ESC of its ST terminator", () => {
+    // The nastiest boundary: the tail is a lone ESC with the whole unterminated
+    // OSC in front of it, so carrying only the last escape lost the copy.
+    const { scanner, clips } = makeScanner();
+    scanner.scan(`\x1b]52;c;${b64("hi")}\x1b`);
+    expect(clips).toEqual([]);
+    scanner.scan("\\rest of the output");
+    expect(clips).toEqual([b64("hi")]);
+  });
+
   it("answers DECRQM with the mode the child actually set", () => {
     const { scanner, responses } = makeScanner();
     scanner.scan("\x1b[?1000h");
@@ -120,6 +156,54 @@ describe("OutputScanner mouse modes", () => {
     responses.length = 0;
     scanner.scan("\x1b[?1006$p");
     expect(responses).toEqual(["\x1b[?1006;2$y"]);
+  });
+});
+
+describe("chunk invariance", () => {
+  // The carry is what makes a split sequence work, and mouse-mode tracking is
+  // what decides whether a pane hands drags to its program. Get the carry wrong
+  // and a pane starts stealing the mouse from an editor, so: however the stream
+  // is cut up, the scanner has to end up in the same place as one shot.
+  const stream = [
+    "\x1b[?1049h\x1b[?2004h", // alt screen, bracketed paste
+    "\x1b]0;a title\x07",
+    "\x1b[?1000h\x1b[?1002h\x1b[?1006h", // mouse on
+    "some output\r\n\x1b[6n",
+    `\x1b]52;c;${b64("copied while running")}\x07`,
+    "\x1b]11;?\x1b\\", // OSC with an ST terminator
+    "\x1b[?1002l\x1b[?1000l", // mouse off again
+    "\x1b[?1003h", // ...and any-motion on
+    "\x1b[5n\x1b[c",
+    `\x1b]52;c;${b64("and one more")}\x1b\\`, // ST-terminated clipboard write
+    "\x1b[?2004l\x1b[?1049l",
+  ].join("");
+
+  const scanIn = (size: number) => {
+    const { scanner, responses, titles, clips } = makeScanner();
+    for (let i = 0; i < stream.length; i += size) scanner.scan(stream.slice(i, i + size));
+    return { modes: scanner.mouseModes(), paste: scanner.pasteMode(), responses, titles, clips };
+  };
+
+  const whole = scanIn(stream.length);
+
+  it("ends up where the one-shot scan does, at every chunk size", () => {
+    expect(trackingLevel(whole.modes)).toBe("any");
+    expect(whole.clips).toEqual([b64("copied while running"), b64("and one more")]);
+    for (const size of [1, 2, 3, 5, 7, 11, 16, 29, 64, 128]) {
+      const got = scanIn(size);
+      expect(got.modes, `modes at chunk ${size}`).toEqual(whole.modes);
+      expect(got.paste, `paste at chunk ${size}`).toEqual(whole.paste);
+      // Answers go out exactly once, not once per chunk. Sorted, because their
+      // ORDER does depend on the chunking: one scan answers every CSI query it
+      // finds before any OSC one, so a stream cut finely enough answers in the
+      // order the queries actually arrived instead. Nothing observed so far
+      // cares (each answer identifies itself), so this only pins down the set.
+      expect(got.responses.toSorted(), `responses at chunk ${size}`).toEqual(
+        whole.responses.toSorted(),
+      );
+      expect(got.titles, `titles at chunk ${size}`).toEqual(whole.titles);
+      expect(got.clips, `clips at chunk ${size}`).toEqual(whole.clips);
+    }
   });
 });
 
@@ -134,5 +218,10 @@ describe("trailingIncompleteEscape", () => {
   });
   it("lone ESC at end carries", () => {
     expect(trailingIncompleteEscape("abc\x1b")).toBe("\x1b");
+    // ...but not on its own when an unterminated OSC precedes it: that ESC is
+    // the first half of the ST that would have ended it.
+    expect(trailingIncompleteEscape("x\x1b]52;c;AAA\x1b")).toBe("\x1b]52;c;AAA\x1b");
+    // A complete sequence stops the walk left.
+    expect(trailingIncompleteEscape("\x1b]0;title\x07\x1b")).toBe("\x1b");
   });
 });
