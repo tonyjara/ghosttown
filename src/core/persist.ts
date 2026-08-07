@@ -79,6 +79,13 @@ export interface PersistedSession {
    * the next write.
    */
   agentOrder?: string[];
+  /**
+   * Agents taken off the sidebar list with the row's `[-]`, by surface id.
+   * Optional and reload-scoped for exactly the same reasons as agentOrder above
+   * — and pruned the same way, so an agent that has since gone takes its hide
+   * with it rather than swallowing a surface that reuses nothing.
+   */
+  hiddenAgents?: string[];
   workspaces: PersistedWorkspace[];
 }
 

@@ -63,8 +63,10 @@ hand the label back to the program.
 Click a pane to focus it, click a tab to select it, click the `×` at a tab's
 right end to close it (double-click the strip's `+` to open one), click a
 sidebar row to move focus into the sidebar on that row (opening the workspace /
-revealing the agent), **drag the divider between panes to resize them** — the
-gap is drawn as a seam and lights up under the pointer. It stays a drag even
+revealing the agent) or the `[-]` at its end to hide that agent from the list
+(`[+n]` in the `AGENTS` header brings them back), **drag the divider between
+panes to resize them** — the gap is drawn as a seam and lights up under the
+pointer. It stays a drag even
 when it crosses a pane whose program owns the mouse.
 
 **Drag a tab along its strip to sort it.** Press it and move: the tab is
@@ -146,6 +148,7 @@ panes. While the sidebar is focused, keys are direct — no prefix:
 | `a` | new workspace (focus follows into its terminal) |
 | `r` | rename the workspace / the selected agent's tab |
 | `d` | delete workspace (confirm dialog) / kill the agent |
+| `h` / `u` | hide the selected agent from the list / unhide all of them |
 
 ### Sidebar agents
 
@@ -161,9 +164,10 @@ own title, which for a real agent is the turn it is in the middle of
 front of it: our status glyph already says that, and better.
 
 ```
-▌✳•claude                    Ghosttown
+ AGENTS (3)              ⚑1 ✳1 [+1]
+▌✳•claude          Ghosttown      [-]
    Add thinking indicator to agents s…
- ✓•claude                    T-Runner
+ ✓•claude          T-Runner       [-]
    Test OOS cancel sequence with Esqu…
 ```
 
@@ -180,6 +184,13 @@ self-sorting list moves the row you just clicked out from under the pointer.
 `shift+J` / `shift+K` drags a row where you want it, the same keys the
 workspaces use, and that arrangement survives a `prefix R` reload. New agents
 join at the end.
+
+**Hiding a row** (`[-]` at its end, or `h`) declutters the list without touching
+the agent: it keeps running, keeps its slot for when it comes back, keeps
+counting in the header's `AGENTS (n)` and its tally, and `prefix a` still finds
+it — it just stops taking up two rows of a sidebar you are trying to read at a
+glance. The header says how many are hidden and takes them all back: `[+2]`, or
+`u`. Hides survive a `prefix R` reload, like the order does.
 
 The agent **you are in** is marked like the workspace you are in, but out of the
 way of its status: a `▌` bar down the left of the row and a dimmer highlight

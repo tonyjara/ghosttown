@@ -219,5 +219,7 @@ prefix = "ctrl+a"
 # While the sidebar is focused (reach it with focus-left from the leftmost
 # pane, or by clicking it), keys are direct (no prefix): j/k move, enter opens,
 # a adds a workspace, r renames (a workspace, or the selected agent's tab),
-# d deletes (workspaces confirm; agents die), and shift+j / shift+k drag the
-# selected workspace down / up to reorder the list. These are not rebindable.
+# d deletes (workspaces confirm; agents die), h hides the selected agent from
+# the list (u puts every hidden one back — it keeps running either way, and the
+# header keeps counting it), and shift+j / shift+k drag the selected workspace
+# down / up to reorder the list. These are not rebindable.

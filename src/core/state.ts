@@ -179,6 +179,13 @@ interface StoreShape {
    * a workspace drag does.
    */
   agentOrder: string[];
+  /**
+   * Agents taken off the sidebar list, by surface id — what the row's `[-]`
+   * writes. A view on the list, not a state of the agent: it keeps running,
+   * keeps counting in the header and the status bar, and the finder still finds
+   * it. Persisted alongside agentOrder, for the same reasons.
+   */
+  hiddenAgents: string[];
 }
 
 let idCounter = 0;
@@ -210,6 +217,7 @@ export const [store, setStore] = createStore<StoreShape>({
   },
   dialog: null,
   agentOrder: [],
+  hiddenAgents: [],
 });
 
 let socketPath = "";
@@ -457,6 +465,35 @@ export function agentEntries(): AgentEntry[] {
 /** The same list, metadata only — what most callers want. */
 export function agentSurfaces(): SurfaceMeta[] {
   return agentEntries().map((e) => e.meta);
+}
+
+/**
+ * The rows the sidebar actually draws: every agent minus the ones you hid with
+ * the `[-]` on their row. Hiding is about the *list*, not about the agent — it
+ * keeps running, keeps its place in the order for when it comes back, and stays
+ * in agentEntries(), which is what the header tally, the status bar and the
+ * agent finder read. So a hidden agent is still one `prefix a` away, and the
+ * header still says how many there are; it just stops taking up two rows of a
+ * sidebar you are trying to read at a glance.
+ *
+ * Every sidebar index — the cursor, the drag, a click — counts in *this* list.
+ */
+export function sidebarAgents(): AgentEntry[] {
+  if (store.hiddenAgents.length === 0) return agentEntries();
+  const hidden = new Set(store.hiddenAgents);
+  return agentEntries().filter((e) => !hidden.has(e.meta.id));
+}
+
+const sidebarAgentSurfaces = (): SurfaceMeta[] => sidebarAgents().map((e) => e.meta);
+
+/**
+ * How many agents the sidebar is holding back — the number in the header's
+ * `[+n]`. Counted as the difference between the two lists rather than from
+ * store.hiddenAgents, so an id whose agent has since quit never inflates it.
+ */
+export function hiddenAgentCount(): number {
+  if (store.hiddenAgents.length === 0) return 0;
+  return agentEntries().length - sidebarAgents().length;
 }
 
 /** Tally for the sidebar header and the status bar. */
@@ -852,6 +889,7 @@ function serializeSession(): PersistedSession {
     // Written out pruned: a surface that is gone is never coming back under the
     // same id, so its slot is dead weight in the file and in every sort.
     agentOrder: store.agentOrder.filter((id) => !!store.surfaces[id]),
+    hiddenAgents: store.hiddenAgents.filter((id) => !!store.surfaces[id]),
     workspaces: store.workspaceOrder.map((wsId) => {
       const ws = store.workspaces[wsId]!;
       const paneIds = ws.layout ? collectPaneIds(ws.layout) : [];
@@ -957,6 +995,7 @@ function restoreSession(snap: PersistedSession, live: Map<string, HostSurfaceInf
       // Ids of surfaces this restore is about to adopt; the ones it respawns
       // instead get fresh ids and drop out of the order on the next write.
       s.agentOrder = snap.agentOrder ?? [];
+      s.hiddenAgents = snap.hiddenAgents ?? [];
     }),
   );
 
@@ -1622,7 +1661,7 @@ export function blurSidebar(): void {
 /** j/k: move within a half; walking past the edge crosses into the other half. */
 export function sidebarMove(delta: 1 | -1): void {
   const wsCount = store.workspaceOrder.length;
-  const agentCount = agentSurfaces().length;
+  const agentCount = sidebarAgents().length;
   setStore(
     produce((s) => {
       const sb = s.sidebar;
@@ -1686,15 +1725,27 @@ export function sidebarDrag(delta: 1 | -1): void {
  * drag writes the whole current order out as the manual one. That is also what
  * makes the first drag stick: from then on every row named is pinned where it
  * was, and only genuinely new agents fall to the bottom.
+ *
+ * A drag moves the row past the neighbour *you can see*, but writes the order of
+ * every agent: a hidden one keeps the slot it had rather than being shuffled to
+ * the end of the list it is not even in, so unhiding puts it back where it was.
  */
 function dragAgent(delta: 1 | -1): void {
   const ids = agentSurfaces().map((m) => m.id);
+  const shown = sidebarAgentSurfaces().map((m) => m.id);
   const from = store.sidebar.agentIdx;
   const to = from + delta;
-  const id = ids[from];
-  if (!id || to < 0 || to >= ids.length) return;
-  ids.splice(from, 1);
-  ids.splice(to, 0, id);
+  const id = shown[from];
+  const past = shown[to];
+  if (!id || !past) return;
+  const at = ids.indexOf(id);
+  const over = ids.indexOf(past);
+  if (at === -1 || over === -1) return;
+  ids.splice(at, 1);
+  // `over` is the neighbour's index *before* the removal: down (over > at) it
+  // has shifted one left, so inserting there lands just after it; up, it has
+  // not moved, so inserting there lands just before it. Both are what we want.
+  ids.splice(over, 0, id);
   setStore(
     produce((s) => {
       s.agentOrder = ids;
@@ -1714,7 +1765,7 @@ export function sidebarEnter(): void {
       blurSidebar();
     }
   } else {
-    const agent = agentSurfaces()[sb.agentIdx];
+    const agent = sidebarAgentSurfaces()[sb.agentIdx];
     if (agent) focusSurface(agent.id);
   }
 }
@@ -1753,7 +1804,7 @@ export function sidebarClickWorkspace(wsId: string): void {
 
 /** Jump into the agent's pane, the way enter does from the keyboard. */
 export function sidebarClickAgent(surfaceId: string): void {
-  const idx = agentSurfaces().findIndex((m) => m.id === surfaceId);
+  const idx = sidebarAgentSurfaces().findIndex((m) => m.id === surfaceId);
   if (idx === -1) return;
   setStore(
     produce((s) => {
@@ -1777,7 +1828,7 @@ export function sidebarRename(): void {
     if (wsId) openRenameWorkspace(wsId);
     return;
   }
-  const agent = agentSurfaces()[sb.agentIdx];
+  const agent = sidebarAgentSurfaces()[sb.agentIdx];
   if (agent) openRenameTab(agent.id);
 }
 
@@ -1790,10 +1841,18 @@ export function sidebarDelete(): void {
     if (wsId) openDeleteWorkspace(wsId);
     return;
   }
-  const agent = agentSurfaces()[sb.agentIdx];
+  const agent = sidebarAgentSurfaces()[sb.agentIdx];
   if (!agent) return;
   closeSurface(agent.id);
-  const remaining = agentSurfaces().length;
+  selectAgentRow(sidebarAgents().length);
+}
+
+/**
+ * Keep the cursor on a row that exists after the list got shorter — a kill, or a
+ * hide. With nothing left to point at, the selection goes back up to the
+ * workspaces rather than sitting on an empty half.
+ */
+function selectAgentRow(remaining: number): void {
   setStore(
     produce((s) => {
       if (remaining === 0) {
@@ -1804,6 +1863,33 @@ export function sidebarDelete(): void {
       }
     }),
   );
+}
+
+/**
+ * `[-]` on the row: take this agent off the sidebar list. Nothing happens to the
+ * agent itself — this is the "I am not working on that one right now" of a
+ * profile with fifteen of them, next to `d`, which kills.
+ */
+export function hideAgent(surfaceId: string): void {
+  if (!store.surfaces[surfaceId] || store.hiddenAgents.includes(surfaceId)) return;
+  const remaining = sidebarAgents().filter((e) => e.meta.id !== surfaceId).length;
+  setStore("hiddenAgents", (ids) => [...ids, surfaceId]);
+  selectAgentRow(remaining);
+  pushLayout();
+}
+
+/** `[+n]` in the header: put every hidden agent back, where it was. */
+export function unhideAllAgents(): void {
+  if (store.hiddenAgents.length === 0) return;
+  setStore("hiddenAgents", []);
+  pushLayout();
+}
+
+/** h: hide the selected agent, the keyboard's way to the row's `[-]`. */
+export function sidebarHide(): void {
+  if (store.sidebar.section !== "agents") return;
+  const agent = sidebarAgentSurfaces()[store.sidebar.agentIdx];
+  if (agent) hideAgent(agent.id);
 }
 
 // ---------------------------------------------------------------------------

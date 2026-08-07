@@ -13,11 +13,15 @@ import {
   agentSurfaces,
   createWorkspace,
   focusedPaneId,
+  hiddenAgentCount,
+  hideAgent,
   hostEvents,
   newTab,
   setStore,
+  sidebarAgents,
   sidebarDrag,
   store,
+  unhideAllAgents,
 } from "./state";
 import type { AgentStatus } from "./types";
 
@@ -39,6 +43,11 @@ function surface(
 
 const entriesFor = (...ids: string[]) => agentEntries().filter((e) => ids.includes(e.meta.id));
 const idsIn = (...ids: string[]) => entriesFor(...ids).map((e) => e.meta.id);
+/** The same, but of the rows the sidebar draws — hidden agents left out. */
+const shownIn = (...ids: string[]) =>
+  sidebarAgents()
+    .filter((e) => ids.includes(e.meta.id))
+    .map((e) => e.meta.id);
 
 describe("agentEntries", () => {
   it("lists an idle agent nobody has heard from — the whole point of detection", () => {
@@ -208,6 +217,66 @@ describe("agentEntries", () => {
     const was = at();
     sidebarDrag(1); // already last: the list is unchanged
     expect(at()).toBe(was);
+  });
+});
+
+/**
+ * Hiding is about the sidebar list, not about the agent: `[-]` on a row is the
+ * "I am not working on that one right now" of a profile with fifteen of them,
+ * and everything else — the header count, the finder, the agent itself — carries
+ * on as if you had not pressed it.
+ */
+describe("hidden agents", () => {
+  it("takes the row off the list and leaves everything else alone", () => {
+    const kept = surface("h-kept", { agent: "claude", status: "working" });
+    const before = agentCounts();
+    const hiddenBefore = hiddenAgentCount();
+    hideAgent(kept);
+    try {
+      expect(shownIn(kept)).toEqual([]);
+      // Still an agent of this profile: the header tally and the status bar
+      // count it, and `prefix a` still finds it.
+      expect(idsIn(kept)).toEqual([kept]);
+      expect(agentCounts()).toEqual(before);
+      expect(hiddenAgentCount() - hiddenBefore).toBe(1);
+    } finally {
+      unhideAllAgents();
+    }
+    expect(shownIn(kept)).toEqual([kept]);
+    expect(hiddenAgentCount()).toBe(hiddenBefore);
+  });
+
+  it("moves the cursor onto a row that still exists", () => {
+    const gone = surface("h-clamp", { agent: "claude" });
+    setStore("sidebar", "section", "agents");
+    setStore("sidebar", "agentIdx", sidebarAgents().findIndex((e) => e.meta.id === gone));
+    hideAgent(gone);
+    try {
+      // It was the last row (a new workspace lands at the end), so the cursor
+      // has to come back a row rather than point past the end of the list.
+      expect(store.sidebar.agentIdx).toBe(sidebarAgents().length - 1);
+    } finally {
+      unhideAllAgents();
+    }
+  });
+
+  it("drags past the neighbour you can see, and holds the hidden one's slot", () => {
+    const first = surface("h-drag-first", { agent: "claude" });
+    const skipped = surface("h-drag-skipped", { agent: "claude" });
+    const last = surface("h-drag-last", { agent: "claude" });
+    expect(idsIn(first, skipped, last)).toEqual([first, skipped, last]);
+    hideAgent(skipped);
+    try {
+      setStore("sidebar", "section", "agents");
+      setStore("sidebar", "agentIdx", sidebarAgents().findIndex((e) => e.meta.id === first));
+      sidebarDrag(1); // one row down is `last` — `skipped` is not on screen
+      expect(shownIn(first, last)).toEqual([last, first]);
+    } finally {
+      unhideAllAgents();
+    }
+    // The drag wrote an order for the whole list, so the row that was not in it
+    // comes back where it was rather than at the end of it.
+    expect(idsIn(first, skipped, last)).toEqual([skipped, last, first]);
   });
 });
 

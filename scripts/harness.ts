@@ -988,6 +988,32 @@ async function main(): Promise<void> {
     console.log(frame("after clicking an agent's context line"));
     expect("clicking the context line jumps into that agent", term.getText().includes("ctx_click"));
 
+    // `[-]` on a row hides it; `[+n]` in the header brings them all back. Both
+    // are found by searching the line rather than by counting columns, so the
+    // test says nothing about how wide the sidebar happens to be.
+    {
+      const rowsNow = () => term.getText().split("\n");
+      const rowAt = rowsNow().findIndex((l) => l.includes("Fix the sidebar rows")) - 1;
+      const hideCol = (rowsNow()[rowAt] ?? "").indexOf("[-]") + 2; // on the `-`
+      expect("an agent row carries a [-] to hide it", hideCol > 1);
+      click(hideCol, rowAt + 1);
+      const hid = await settle(/\[\+1\]/);
+      console.log(frame("after hiding an agent row"));
+      // The sidebar's own copy of the title — the tab strip and the status bar
+      // keep showing it, which is the point: only the *list* got shorter.
+      const listed = () => rowsNow().some((l) => /^ {3}Fix the sidebar rows/.test(l));
+      expect("clicking [-] takes the row off the list", hid && !listed());
+      // Off the list, not out of the profile — the header still counts it, and
+      // the click never moved the keys out of the pane they were in.
+      expect("...while the header still counts it", /AGENTS \(2\)/.test(term.getText()));
+      const headerAt = rowsNow().findIndex((l) => l.includes("AGENTS ("));
+      const unhideCol = (rowsNow()[headerAt] ?? "").indexOf("[+1]") + 2;
+      click(unhideCol, headerAt + 1);
+      const back = await settle(/Fix the sidebar rows/);
+      console.log(frame("after unhiding from the header"));
+      expect("the header's [+n] puts every hidden row back", back);
+    }
+
     pty.write('kill "$AGENT"\r');
     const gone = await settle(/AGENTS \(1\)/);
     console.log(frame("quit agent leaves the list"));

@@ -1,17 +1,20 @@
-import { For, Show, createMemo } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 import type { MouseEvent } from "@opentui/core";
 import {
   activeSurfaceId,
   agentContext,
   agentCounts,
-  agentEntries,
   agentLabel,
   focusSidebar,
+  hiddenAgentCount,
+  hideAgent,
+  sidebarAgents,
   sidebarClickAgent,
   sidebarClickProfile,
   sidebarClickWorkspace,
   sidebarWidth,
   store,
+  unhideAllAgents,
   type AgentEntry,
 } from "../core/state";
 import { truncate, twoColumnRow, windowStart } from "./list";
@@ -23,6 +26,9 @@ const MIN_AGENT_ROWS = 5;
 
 /** An agent is two rows: who it is, then what it is working on. */
 const AGENT_ROWS = 2;
+
+/** Takes the row off the list, not the agent off the machine. */
+const HIDE = "[-]";
 
 /**
  * Left sidebar: profile name on top, then two halves — workspaces and every
@@ -46,8 +52,17 @@ export function Sidebar() {
   };
   const bottomH = () => Math.max(2, height() - 1 - topH());
 
-  const agents = createMemo(() => agentEntries());
+  // The rows: hidden agents are out of this list and out of every index that
+  // counts in it — but still in `counts`, which is the whole profile.
+  const agents = createMemo(() => sidebarAgents());
   const counts = createMemo(() => agentCounts());
+  const hidden = createMemo(() => hiddenAgentCount());
+
+  // Which button the pointer is on. Kept here rather than per row: the rows are
+  // rebuilt whenever an agent changes status, and a highlight that dies under a
+  // motionless pointer looks like the button stopped working.
+  const [hotHide, setHotHide] = createSignal("");
+  const [hotUnhide, setHotUnhide] = createSignal(false);
 
   /**
    * The agent you are *in*: the tab the keys go to, which survives focus moving
@@ -102,6 +117,10 @@ export function Sidebar() {
    *
    * Reactive by being read inside a prop: `workingPulse()` ticks, so the rows
    * of the agents that are thinking animate and every other row stays put.
+   *
+   * The last three columns belong to the row's `[-]`, which is drawn beside this
+   * text rather than in it — so the workspace column ends where the button
+   * begins instead of underneath it.
    */
   const agentRow = (e: AgentEntry) => {
     // An agent sitting at its prompt (○) and one no process poll can see (·) —
@@ -116,7 +135,11 @@ export function Sidebar() {
     const unread = e.meta.unread ? "•" : " ";
     const ws = store.workspaceOrder.length > 1 ? truncate(e.workspace, 12) : "";
     const bar = e.meta.id === here() ? "▌" : " ";
-    return twoColumnRow(`${bar}${glyph}${unread}${agentLabel(e.meta)}`, ws ? `${ws} ` : "", width());
+    return twoColumnRow(
+      `${bar}${glyph}${unread}${agentLabel(e.meta)}`,
+      ws ? `${ws} ` : "",
+      Math.max(1, width() - HIDE.length),
+    );
   };
 
   /**
@@ -156,15 +179,23 @@ export function Sidebar() {
     return e.meta.id === here() ? theme.sidebarCurBg : theme.sidebarBg;
   };
 
-  /** `AGENTS (5)  ⚑1 ✳2` — the tally covers the ones scrolled out of view. */
+  /**
+   * `AGENTS (5)  ⚑1 ✳2` — the count and the tally are the whole profile, hidden
+   * rows included: the point of hiding one is to stop reading it, not to stop
+   * knowing about it. What it is doing still lands in this line.
+   */
   const agentHeader = () => {
     const c = counts();
     const tally = (["blocked", "working", "done"] as const)
       .filter((s) => c[s] > 0)
       .map((s) => `${statusGlyph(s).glyph}${c[s]}`)
       .join(" ");
-    return twoColumnRow(` AGENTS (${c.total})`, tally ? `${tally} ` : "", width());
+    const room = width() - (hidden() > 0 ? unhide().length : 0);
+    return twoColumnRow(` AGENTS (${c.total})`, tally ? `${tally} ` : "", Math.max(1, room));
   };
+
+  /** `[+2]` — how many rows are hidden, and the button that brings them back. */
+  const unhide = () => `[+${hidden()}]`;
 
   /**
    * A row click acts on its own; without this it would bubble to the sidebar
@@ -219,11 +250,31 @@ export function Sidebar() {
         </For>
       </box>
       <box height={bottomH()} flexDirection="column" backgroundColor={theme.sidebarBg} flexShrink={0}>
-        <text content={agentHeader()} fg={theme.idle} bg={theme.sidebarBg} selectable={false} />
+        <box height={1} flexDirection="row" flexShrink={0} backgroundColor={theme.sidebarBg}>
+          <text content={agentHeader()} fg={theme.idle} bg={theme.sidebarBg} selectable={false} />
+          {/* Only there when it has something to do — an empty `[+0]` in the
+              header of a list nobody has hidden from is just noise. */}
+          <Show when={hidden() > 0}>
+            <text
+              content={unhide()}
+              fg={hotUnhide() ? theme.accent : theme.idle}
+              bg={theme.sidebarBg}
+              selectable={false}
+              onMouseDown={rowClick(unhideAllAgents)}
+              onMouseOver={() => setHotUnhide(true)}
+              onMouseOut={() => setHotUnhide(false)}
+            />
+          </Show>
+        </box>
         <Show
           when={agents().length > 0}
           fallback={
-            <text content="  (none)" fg={theme.idle} bg={theme.sidebarBg} selectable={false} />
+            <text
+              content={hidden() > 0 ? "  (all hidden)" : "  (none)"}
+              fg={theme.idle}
+              bg={theme.sidebarBg}
+              selectable={false}
+            />
           }
         >
           <For each={agentWindow()}>
@@ -237,12 +288,27 @@ export function Sidebar() {
                 flexShrink={0}
                 onMouseDown={rowClick(() => sidebarClickAgent(entry.e.meta.id))}
               >
-                <text
-                  content={agentRow(entry.e)}
-                  fg={agentSelected(entry.idx) ? theme.tabFgActive : agentRowFg(entry.e)}
-                  bg={agentRowBg(entry.e, entry.idx)}
-                  selectable={false}
-                />
+                <box height={1} flexDirection="row" flexShrink={0}>
+                  <text
+                    content={agentRow(entry.e)}
+                    fg={agentSelected(entry.idx) ? theme.tabFgActive : agentRowFg(entry.e)}
+                    bg={agentRowBg(entry.e, entry.idx)}
+                    selectable={false}
+                  />
+                  {/* Always drawn, so no row shifts under the pointer; it lights
+                      up on hover, which is what says it is a button. Dim, and in
+                      the accent rather than the kill red `×` uses: hiding is the
+                      reversible one. */}
+                  <text
+                    content={HIDE}
+                    fg={hotHide() === entry.e.meta.id ? theme.accent : theme.idle}
+                    bg={agentRowBg(entry.e, entry.idx)}
+                    selectable={false}
+                    onMouseDown={rowClick(() => hideAgent(entry.e.meta.id))}
+                    onMouseOver={() => setHotHide(entry.e.meta.id)}
+                    onMouseOut={() => setHotHide("")}
+                  />
+                </box>
                 <text
                   content={agentContextRow(entry.e)}
                   fg={agentSelected(entry.idx) ? theme.tabFg : theme.idle}

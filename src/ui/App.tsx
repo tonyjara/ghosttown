@@ -57,12 +57,14 @@ import {
   sidebarDelete,
   sidebarDrag,
   sidebarEnter,
+  sidebarHide,
   sidebarMove,
   sidebarRename,
   splitPane,
   startDividerDrag,
   store,
   toggleSidebar,
+  unhideAllAgents,
   workspaceOf,
   writeToFocused,
 } from "../core/state";
@@ -297,6 +299,14 @@ function handleSidebarKey(key: KeyEvent): void {
       return;
     case "d":
       sidebarDelete();
+      return;
+    // The row's `[-]` and the header's `[+n]`, for the keyboard: hide the
+    // selected agent, and put every hidden one back.
+    case "h":
+      sidebarHide();
+      return;
+    case "u":
+      unhideAllAgents();
       return;
     case "escape":
       blurSidebar();

@@ -355,6 +355,7 @@ export function helpSections(config: Config): HelpSection[] {
   byCategory.get("Profiles")?.push({ keys: "a r d", label: "in list: new/rename/kill" });
   byCategory.get("Sidebar")?.push({ keys: "j k ⏎", label: "move / open" });
   byCategory.get("Sidebar")?.push({ keys: "a r d", label: "new / rename / delete" });
+  byCategory.get("Sidebar")?.push({ keys: "h u", label: "hide agent / unhide all" });
   byCategory.get("Sidebar")?.push({ keys: "click", label: "focus that row" });
   byCategory.get("Other")?.push({ keys: prefix, label: `send literal ${prefix}` });
 
